@@ -1,0 +1,55 @@
+{
+  "suiteElapsedMs": 162960,
+  "totalPassed": 8,
+  "totalTests": 8,
+  "results": [
+    {
+      "file": "test_01_sequential.js",
+      "passed": true,
+      "code": 0,
+      "elapsedMs": 46055
+    },
+    {
+      "file": "test_02_invalid_response.js",
+      "passed": true,
+      "code": 0,
+      "elapsedMs": 44731
+    },
+    {
+      "file": "test_03_gemini_early_exit.js",
+      "passed": true,
+      "code": 0,
+      "elapsedMs": 40753
+    },
+    {
+      "file": "test_04_request_timeout.js",
+      "passed": true,
+      "code": 0,
+      "elapsedMs": 15613
+    },
+    {
+      "file": "test_05_malformed_ndjson.js",
+      "passed": true,
+      "code": 0,
+      "elapsedMs": 220
+    },
+    {
+      "file": "test_06_claude_early_exit.js",
+      "passed": true,
+      "code": 0,
+      "elapsedMs": 657
+    },
+    {
+      "file": "test_07_duplicate_late_response.js",
+      "passed": true,
+      "code": 0,
+      "elapsedMs": 248
+    },
+    {
+      "file": "test_08_cleanup_after_failure.js",
+      "passed": true,
+      "code": 0,
+      "elapsedMs": 14674
+    }
+  ]
+}

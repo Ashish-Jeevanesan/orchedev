@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Agent Workbench — Claude + Gemini</title>
+  <link rel="stylesheet" href="/vendor/xterm/xterm.css">
+  <link rel="stylesheet" href="/css/workbench.css">
+</head>
+<body>
+  <!-- Top Navigation & Global Status Header -->
+  <header class="app-header">
+    <div class="header-left">
+      <div class="app-logo">
+        <span class="logo-icon" id="icon-logo"></span>
+        <span class="logo-title">AGENT WORKBENCH</span>
+        <span class="logo-badge">LOCAL</span>
+      </div>
+      <div class="system-pills">
+        <div class="pill" id="pill-claude" title="Claude Code Interactive Terminal">
+          <span class="pill-dot"></span>
+          <span class="pill-label">Claude CLI:</span>
+          <span class="pill-val" id="val-claude">STOPPED</span>
+        </div>
+        <div class="pill" id="pill-gemini" title="Gemini CLI Interactive Terminal">
+          <span class="pill-dot"></span>
+          <span class="pill-label">Gemini CLI:</span>
+          <span class="pill-val" id="val-gemini">STOPPED</span>
+        </div>
+        <div class="pill" id="pill-persistence">
+          <span class="pill-label">Storage:</span>
+          <span class="pill-val highlight-green">DURABLE</span>
+        </div>
+        <div class="pill pill-warning" id="pill-approvals" style="display:none; cursor:pointer;" title="Click to review pending delegations">
+          <span class="pill-dot blink"></span>
+          <span class="pill-label">Approvals:</span>
+          <span class="pill-val" id="val-approvals">0 PENDING</span>
+        </div>
+      </div>
+      <div class="workspace-bar">
+        <span class="ws-label" id="ws-label-folder" title="Active Project Workspace">Working Folder:</span>
+        <span class="ws-path" id="ws-path-display" title="Click to manually enter path">D:\Ashish_P\AI-Tools\custom-OCT</span>
+        <button class="btn btn-xs btn-outline" id="btn-copy-ws-path" title="Copy current workspace path to clipboard">Copy</button>
+        <select id="ws-quick-switch" class="select-input select-xs" title="Switch between authorized workspace roots" style="display:none;"></select>
+        <button class="btn btn-xs btn-outline" id="btn-browse-folder" title="Browse for project folder via Windows native dialog">Browse...</button>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="connection-status connected" id="ws-status" title="Real-time WebSocket event connection">
+        <span class="status-dot"></span>
+        <span class="status-text">Connected</span>
+      </div>
+      <button class="btn btn-sm btn-danger" id="btn-shutdown" title="Terminate all processes and close workbench">Shutdown</button>
+    </div>
+  </header>
+
+  <!-- Main Body Layout: Left Sidebar (Composer & Task List), Center (Terminal), Right (Task Detail) -->
+  <main class="workbench-layout">
+    <!-- Left Sidebar: Task Prompt Composer & Task Navigation -->
+    <aside class="pane sidebar-pane">
+      <div class="pane-header">
+        <div class="pane-title">
+          <span class="pane-icon" id="icon-sidebar-title"></span>
+          <span>Task Composer</span>
+        </div>
+      </div>
+
+      <!-- Task Composer Section -->
+      <div class="task-composer">
+        <div class="composer-controls">
+          <div class="control-group">
+            <label for="agent-selector">Target Agent:</label>
+            <select id="agent-selector" class="select-input">
+              <option value="gemini" selected>Gemini CLI (Interactive Session)</option>
+            </select>
+          </div>
+          <button class="btn btn-primary" id="btn-dispatch-task" title="Dispatch task (Ctrl+Enter)">
+            <span class="btn-icon" id="icon-dispatch-btn"></span> Dispatch Task
+          </button>
+        </div>
+        <textarea id="task-prompt-input" class="textarea-input" placeholder="Enter task instruction or prompt for Gemini CLI (requires human approval)..."></textarea>
+        <div class="composer-footer">
+          <span class="composer-hint">Tip: <kbd>Ctrl+Enter</kbd> submit &bull; <kbd>&uarr;</kbd> history</span>
+          <span class="composer-validation" id="composer-validation-msg" style="display:none;"></span>
+        </div>
+      </div>
+
+      <!-- Task Navigation List -->
+      <div class="task-list-panel">
+        <div class="task-list-toolbar">
+          <div class="task-search-bar">
+            <span class="search-icon-wrap" id="icon-search-wrap"></span>
+            <input type="text" id="task-search-input" class="search-input" placeholder="Search tasks by ID or keyword..." />
+          </div>
+          <div class="filter-tabs" id="task-filter-tabs">
+            <button class="filter-btn active" data-filter="all" id="btn-filter-all">All <span class="filter-count" id="count-all">0</span></button>
+            <button class="filter-btn" data-filter="active" id="btn-filter-active">Active <span class="filter-count" id="count-active">0</span></button>
+            <button class="filter-btn" data-filter="approvals" id="btn-filter-approvals">Approvals <span class="filter-count" id="count-approvals">0</span></button>
+            <button class="filter-btn" data-filter="completed" id="btn-filter-completed">Done <span class="filter-count" id="count-completed">0</span></button>
+            <button class="filter-btn" data-filter="failed" id="btn-filter-failed">Failed <span class="filter-count" id="count-failed">0</span></button>
+          </div>
+        </div>
+        <div class="task-list" id="task-list-container">
+          <div class="empty-state">No delegated tasks match current filter.</div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Center Pane: Interactive ConPTY Terminal Workspace -->
+    <section class="pane terminal-pane">
+      <div class="pane-header">
+        <div class="terminal-tabs">
+          <button class="tab-btn active" data-term="claude" id="tab-claude" title="Switch to Claude Code interactive session">
+            <span class="tab-icon" id="icon-tab-claude"></span> Claude Code CLI
+            <span class="badge badge-sm badge-outline" id="tab-badge-claude" title="ConPTY Process Status">PTY: STOPPED</span>
+            <span class="badge badge-sm badge-outline" id="mcp-badge-claude" title="MCP Bridge Session Status">MCP: OFFLINE</span>
+          </button>
+          <button class="tab-btn" data-term="gemini" id="tab-gemini" title="Switch to Gemini CLI interactive session">
+            <span class="tab-icon" id="icon-tab-gemini"></span> Gemini CLI
+            <span class="badge badge-sm badge-outline" id="tab-badge-gemini" title="ConPTY Process Status">PTY: STOPPED</span>
+            <span class="badge badge-sm badge-outline" id="mcp-badge-gemini" title="MCP Bridge Session Status">MCP: OFFLINE</span>
+          </button>
+        </div>
+        <div class="terminal-controls">
+          <button class="btn btn-xs btn-primary" id="btn-term-start" title="Spawn terminal ConPTY process">Start</button>
+          <button class="btn btn-xs btn-secondary" id="btn-term-restart" title="Restart terminal process">Restart</button>
+          <button class="btn btn-xs btn-danger" id="btn-term-stop" title="Terminate terminal process tree">Terminate</button>
+          <button class="btn btn-xs btn-outline" id="btn-term-clear" title="Clear xterm visible display buffer (does not write to PTY stdin)">Clear Buffer</button>
+        </div>
+      </div>
+      <div class="terminal-meta-bar">
+        <span class="meta-item"><span class="meta-label">Mode:</span> ConPTY Interactive</span>
+        <span class="meta-item"><span class="meta-label">PID:</span> <span id="term-pid">-</span></span>
+        <span class="meta-item"><span class="meta-label">MCP:</span> <span id="term-mcp-status" class="meta-mcp">OFFLINE</span></span>
+        <span class="meta-item"><span class="meta-label">CWD:</span> <span id="term-cwd" class="meta-cwd">-</span></span>
+        <span class="meta-item"><span class="meta-label">Size:</span> <span id="term-size">80x24</span></span>
+        <span class="meta-item isolation-tag" id="tag-isolated" title="Keystrokes are sent directly to ConPTY stdin with zero agent injection">Isolated</span>
+      </div>
+      <div class="terminal-body" id="terminal-wrapper">
+        <div id="term-container-claude" class="term-instance-container"></div>
+        <div id="term-container-gemini" class="term-instance-container" style="display: none;"></div>
+      </div>
+    </section>
+
+    <!-- Right Pane: Task Detail Inspector -->
+    <section class="pane task-detail-pane">
+      <div class="pane-header">
+        <div class="pane-title">
+          <span class="pane-icon" id="icon-inspector-title"></span>
+          <span>Task Detail Inspector</span>
+          <span class="badge badge-sm badge-secondary">Real-Time</span>
+        </div>
+      </div>
+      <div class="task-detail-panel" id="task-detail-container">
+        <div class="empty-state">Select a task on the left to inspect parameters, execution timeline, and output.</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Area C: Activity Feed Drawer -->
+  <footer class="activity-drawer" id="activity-drawer">
+    <div class="drawer-header" id="drawer-toggle">
+      <div class="drawer-title">
+        <span class="drawer-icon" id="icon-drawer-arrow"></span>
+        <span>Real-Time Activity Feed</span>
+        <span class="badge badge-xs badge-info" id="activity-count">0</span>
+      </div>
+      <div class="drawer-actions" onclick="event.stopPropagation();">
+        <div class="activity-filters" id="activity-filters">
+          <button class="filter-chip active" data-sev="ALL">All</button>
+          <button class="filter-chip" data-sev="TASKS">Tasks</button>
+          <button class="filter-chip" data-sev="TERMINALS">Terminals</button>
+          <button class="filter-chip" data-sev="SECURITY">Security</button>
+          <button class="filter-chip" data-sev="ERRORS">Errors</button>
+        </div>
+        <button class="btn btn-xs btn-outline" id="btn-clear-activity">Clear Feed</button>
+      </div>
+    </div>
+    <div class="drawer-body" id="activity-feed"></div>
+  </footer>
+
+  <!-- Modal: Human Delegation Approval -->
+  <div class="modal-backdrop" id="modal-approval" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="modal-approval-title">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <div class="modal-title" id="modal-approval-title">
+          <span class="modal-icon" id="icon-modal-warn"></span>
+          <span>Task Delegation Approval Required</span>
+        </div>
+        <div class="modal-carousel-nav" id="modal-carousel-nav" style="display:none;">
+          <button class="btn btn-xs btn-outline" id="btn-appr-prev" title="Previous pending task">&larr; Prev</button>
+          <span class="carousel-counter" id="appr-carousel-counter">1 of 1</span>
+          <button class="btn btn-xs btn-outline" id="btn-appr-next" title="Next pending task">Next &rarr;</button>
+        </div>
+        <button class="btn-close" id="btn-close-approval" title="Close (Esc)">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="approval-meta-grid">
+          <div class="meta-field">
+            <span class="meta-k">Correlation ID:</span>
+            <span class="meta-v font-mono" id="appr-corr-id">-</span>
+          </div>
+          <div class="meta-field">
+            <span class="meta-k">Source Agent:</span>
+            <span class="meta-v highlight" id="appr-source-agent">Claude Code</span>
+          </div>
+          <div class="meta-field">
+            <span class="meta-k">Target Agent:</span>
+            <span class="meta-v highlight-green" id="appr-target-agent">Gemini CLI</span>
+          </div>
+          <div class="meta-field">
+            <span class="meta-k">Working Directory:</span>
+            <span class="meta-v font-mono" id="appr-cwd">-</span>
+          </div>
+          <div class="meta-field">
+            <span class="meta-k">Expected Files:</span>
+            <span class="meta-v" id="appr-expected-files">-</span>
+          </div>
+          <div class="meta-field">
+            <span class="meta-k">Created:</span>
+            <span class="meta-v" id="appr-created-time">-</span>
+          </div>
+        </div>
+
+        <div class="approval-section">
+          <label class="section-label">Proposed Plan (Claude):</label>
+          <div class="plan-box" id="appr-plan-text">-</div>
+        </div>
+
+        <div class="approval-section">
+          <div class="section-header-flex">
+            <label class="section-label" for="appr-instructions-input">Detailed Instructions for Gemini:</label>
+            <span class="badge badge-xs badge-info" id="badge-instructions-edited" style="display:none;">EDITED BY HUMAN</span>
+          </div>
+          <textarea id="appr-instructions-input" class="textarea-input appr-textarea" rows="4"></textarea>
+          <div class="help-text">You can edit the instructions above before approving. Claude's original instructions remain recorded for audit.</div>
+        </div>
+
+        <div class="approval-section">
+          <div class="impact-box">
+            <span class="impact-icon" id="icon-impact-shield"></span>
+            <span id="appr-impact-text">Target: Gemini CLI interactive session. Approving makes this task claimable in Gemini's inbox. Native file and command permissions will still be enforced by Gemini CLI.</span>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <span class="modal-hint">Press <kbd>Ctrl+Enter</kbd> to Approve &bull; <kbd>Esc</kbd> to Dismiss</span>
+        <button class="btn btn-sm btn-danger" id="btn-appr-reject">Reject Plan</button>
+        <button class="btn btn-sm btn-secondary" id="btn-appr-cancel">Cancel</button>
+        <button class="btn btn-sm btn-success" id="btn-appr-approve">
+          <span class="btn-icon" id="icon-appr-check"></span> Approve Plan
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Custom Dialog Container (Confirm / Prompt / Alert) -->
+  <div class="modal-backdrop" id="modal-custom-dialog" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="dialog-modal-title"></div>
+
+  <!-- Toast Notification Container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <!-- Scripts -->
+  <script src="/vendor/xterm/xterm.js"></script>
+  <script src="/vendor/xterm/addon-fit.js"></script>
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

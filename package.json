@@ -1,0 +1,38 @@
+{
+  "name": "custom-oct",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server/launcher.js",
+    "test": "node tests/run_all_tests.js",
+    "test:core": "node tests/run_all_tests.js",
+    "test:ui": "node tests/ui_integration_tests.js",
+    "test:tabs": "node tests/test_tab_switch_regression.js",
+    "test:cwd": "node tests/test_working_directory.js",
+    "test:restart_cwd": "node tests/test_terminal_restart_cwd.js",
+    "test:echo": "node tests/test_single_character_echo.js",
+    "test:mcp": "node tests/test_mcp_bridge_lifecycle.js",
+    "test:cli_mcp": "node tests/test_interactive_cli_mcp_integration.js && node tests/test_gemini_cli_mcp_claim.js && node tests/test_claude_cli_mcp_discovery.js",
+    "test:phase2": "node tests/test_phase2_human_delegation.js",
+    "test:dispatch_unify": "node tests/test_phase2_dispatch_unification.js",
+    "test:workstreams_ab": "node tests/test_phase3_workstreams_a_b.js",
+    "test:workstream_c": "node tests/test_phase3_workstream_c.js",
+    "test:workstream_d": "node tests/test_phase3_workstream_d.js",
+    "test:workstream_e": "node tests/test_phase3_workstream_e.js",
+    "test:workstream_f": "node tests/test_phase3_workstream_f.js",
+    "test:cwd_auth": "node tests/test_phase3_workstream_f_cwd_authorization.js",
+    "test:workstream_g": "node tests/test_phase3_workstream_g.js",
+    "test:workstream_h": "node tests/test_phase3_workstream_h_e2e.js",
+    "test:audit": "node tests/acceptance/run_acceptance_audit.js",
+    "test:utils": "node --test utils/date-utils.test.js",
+    "test:all": "node tests/run_all_tests.js && node tests/ui_integration_tests.js && node tests/test_tab_switch_regression.js && node tests/test_working_directory.js && node tests/test_single_character_echo.js && node tests/test_terminal_restart_cwd.js && node tests/mcp_bridge_lifecycle.js && node tests/acceptance/run_acceptance_audit.js && node --test utils/date-utils.test.js"
+  },
+  "dependencies": {
+    "@homebridge/node-pty-prebuilt-multiarch": "^0.14.1",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "ws": "^8.22.0"
+  }
+}

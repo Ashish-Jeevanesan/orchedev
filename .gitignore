@@ -1,0 +1,26 @@
+# Node.js dependencies
+node_modules/
+
+# Runtime & session state
+.workbench/
+.workbench_tasks.json
+.workbench_tasks.json.corrupt_*
+.workbench_workspaces.json
+.workbench_session.json
+.gemini/
+
+# Logs
+logs/
+*.log
+
+# Test artifacts and temporary test workspaces
+tests/temp_workspace*/
+claude_structured_result.json
+gemini_acp_result.json
+e2e_proof_report.json
+
+# OS & Editor metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
