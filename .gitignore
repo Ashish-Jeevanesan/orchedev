@@ -24,3 +24,7 @@ e2e_proof_report.json
 Thumbs.db
 .vscode/
 .idea/
+
+# Device-specific launchers (kept local only, not pushed to GitHub)
+start-workbench.vbs
+start-workbench-office.vbs
