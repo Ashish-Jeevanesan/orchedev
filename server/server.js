@@ -12,6 +12,8 @@ import { TaskCoordinatorService } from './task_coordinator_service.js';
 import { IntercomService, TaskSecurityError } from './intercom_service.js';
 import { WorkspaceAuthorizationService } from './workspace_authorization.js';
 import { logger } from './logger.js';
+import { fileURLToPath as __toPath } from 'url';
+const __serverDir = path.dirname(__toPath(import.meta.url));
 
 function openWindowsFolderPicker() {
   return new Promise((resolve, reject) => {
@@ -47,7 +49,7 @@ export class WorkbenchServer {
     this.wssTerminals = null;
     this.wssEvents = null;
     this.sessionToken = crypto.randomBytes(24).toString('hex');
-    this.publicDir = path.join(cwd, 'public');
+    this.publicDir = path.join(__serverDir, '..', 'public');
 
     this.terminalManager = new TerminalManager({ cwd });
     this.coordinatorService = null;
@@ -56,6 +58,9 @@ export class WorkbenchServer {
     this.currentProjectCwd = cwd;
     this.eventSockets = new Set();
     this.allocatedPort = null;
+    this._autoPullInterval = null;
+    this._lastAutoPulledTaskId = null;
+    this._lastAutoPullTime = 0;
   }
 
   async start() {
@@ -91,6 +96,12 @@ export class WorkbenchServer {
         this.terminalManager.getTerminalConfig('claude');
         this.terminalManager.getTerminalConfig('gemini');
         console.log(`[WorkbenchServer] Listening strictly on 127.0.0.1:${this.allocatedPort}`);
+
+        // Recurring 15-second auto-pull check for Gemini worker terminal
+        this._autoPullInterval = setInterval(() => {
+          this._checkAndTriggerAutoPull();
+        }, 15000);
+
         resolve({
           port: this.allocatedPort,
           sessionToken: this.sessionToken
@@ -107,6 +118,44 @@ export class WorkbenchServer {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(msg);
       }
+    }
+
+    if (type === 'task_state_changed' && (payload?.to === 'QUEUED_FOR_CLAIM' || payload?.to === 'QUEUED') && payload?.task?.toAgent === 'gemini') {
+      setTimeout(() => this._checkAndTriggerAutoPull(), 1000);
+    }
+  }
+
+  _checkAndTriggerAutoPull() {
+    try {
+      if (!this.intercomService || !this.terminalManager) return;
+      const geminiStatus = this.terminalManager.getStatus('gemini');
+      if (!geminiStatus || geminiStatus.status !== 'RUNNING') return;
+
+      const allDelegations = this.intercomService.getAllDelegations();
+      const isGeminiBusy = allDelegations.some(
+        t => t.toAgent === 'gemini' && (t.state === 'CLAIMED' || t.state === 'RUNNING')
+      );
+      if (isGeminiBusy) return;
+
+      const queuedTasks = allDelegations.filter(
+        t => t.toAgent === 'gemini' && (t.state === 'QUEUED_FOR_CLAIM' || t.state === 'QUEUED')
+      );
+      if (queuedTasks.length === 0) return;
+
+      const targetTask = queuedTasks[0];
+      const now = Date.now();
+      if (this._lastAutoPulledTaskId === targetTask.correlationId && (now - this._lastAutoPullTime) < 60000) {
+        return;
+      }
+
+      this._lastAutoPulledTaskId = targetTask.correlationId;
+      this._lastAutoPullTime = now;
+      logger.info('TERMINAL:AUTO_PULL', `Auto-triggering 'check queue' into Gemini ConPTY for queued task ${targetTask.correlationId}`, {
+        correlationId: targetTask.correlationId
+      });
+      this.terminalManager.write('gemini', 'check queue\r');
+    } catch (err) {
+      logger.warn('TERMINAL:AUTO_PULL_WARN', `Auto-pull trigger error: ${err.message}`);
     }
   }
 
@@ -965,6 +1014,11 @@ export class WorkbenchServer {
 
   async shutdown() {
     console.log('[WorkbenchServer] Shutting down server and all child processes...');
+
+    if (this._autoPullInterval) {
+      clearInterval(this._autoPullInterval);
+      this._autoPullInterval = null;
+    }
 
     for (const ws of this.eventSockets) {
       try { ws.close(); } catch (e) {}

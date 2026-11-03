@@ -6,9 +6,37 @@ import path from 'path';
 import pty from '@homebridge/node-pty-prebuilt-multiarch';
 import { ProcessManager } from '../core/process_manager.js';
 import { logger } from './logger.js';
+import { fileURLToPath as __toPath } from 'url';
+const __serverDir = path.dirname(__toPath(import.meta.url));
 
-const CLAUDE_BIN = 'C:\\Users\\ajeevanesan\\.local\\bin\\claude.exe';
-const GEMINI_BUNDLE_PATH = 'C:\\Users\\ajeevanesan\\AppData\\Local\\nvm\\v22.23.1\\node_modules\\@google\\gemini-cli\\bundle\\gemini.js';
+function resolveClaudeBin() {
+  const candidates = [
+    process.env.CLAUDE_BIN,
+    path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'claude', 'claude.exe'),
+    path.join(process.env.USERPROFILE || '', '.local', 'bin', 'claude.exe'),
+    'C:\\Users\\ajeevanesan\\.local\\bin\\claude.exe'
+  ].filter(Boolean);
+
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return 'claude';
+}
+
+function resolveGeminiBundlePath() {
+  const candidates = [
+    process.env.GEMINI_BUNDLE_PATH,
+    path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@google', 'gemini-cli', 'bundle', 'gemini.js'),
+    'C:\\Users\\ajeevanesan\\AppData\\Local\\nvm\\v22.23.1\\node_modules\\@google\\gemini-cli\\bundle\\gemini.js'
+  ].filter(Boolean);
+
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return null;
+}
+
 const MAX_SCROLLBACK_BYTES = 1024 * 1024; // 1 MB bounded scrollback replay buffer
 
 export class TerminalManager {
@@ -39,7 +67,7 @@ export class TerminalManager {
 
   getTerminalConfig(id, targetCwd = null) {
     const resolvedCwd = targetCwd || this.projectCwd || this.cwd;
-    const bridgeScript = path.join(this.cwd, 'server', 'mcp', 'workbench_mcp_bridge.js');
+    const bridgeScript = path.join(__serverDir, 'mcp', 'workbench_mcp_bridge.js');
 
     if (id === 'claude') {
       const args = [];
@@ -81,12 +109,13 @@ export class TerminalManager {
       }
 
       return {
-        file: CLAUDE_BIN,
+        file: resolveClaudeBin(),
         args,
         name: 'claude-interactive'
       };
     } else if (id === 'gemini') {
-      const args = [GEMINI_BUNDLE_PATH, '--skip-trust'];
+      const bundlePath = resolveGeminiBundlePath();
+      const args = bundlePath ? [bundlePath, '--skip-trust'] : ['--skip-trust'];
       if (this.workbenchPort && this.sessionToken) {
         const geminiDir = path.join(resolvedCwd, '.gemini');
         try {
@@ -129,7 +158,7 @@ export class TerminalManager {
       }
 
       return {
-        file: process.execPath,
+        file: bundlePath ? process.execPath : 'gemini.cmd',
         args,
         name: 'gemini-interactive'
       };
