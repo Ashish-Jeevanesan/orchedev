@@ -8,6 +8,8 @@ import crypto from 'crypto';
 import { spawn } from 'child_process';
 import { WebSocketServer, WebSocket } from 'ws';
 import { TerminalManager } from './terminal_manager.js';
+import { CliSessionRegistry } from './cli_session_registry.js';
+import { SessionPairings } from './session_pairings.js';
 import { TaskCoordinatorService } from './task_coordinator_service.js';
 import { IntercomService, TaskSecurityError } from './intercom_service.js';
 import { WorkspaceAuthorizationService } from './workspace_authorization.js';
@@ -52,6 +54,8 @@ export class WorkbenchServer {
     this.sessionToken = crypto.randomBytes(24).toString('hex');
     this.publicDir = path.join(__serverDir, '..', 'public');
 
+    this.cliSessionRegistry = new CliSessionRegistry({ cwd });
+    this.sessionPairings = new SessionPairings({ cwd });
     this.terminalManager = new TerminalManager({ cwd });
     this.coordinatorService = null;
     this.workspaceAuth = new WorkspaceAuthorizationService({ baseCwd: cwd });
@@ -181,6 +185,63 @@ export class WorkbenchServer {
     } catch (err) {
       logger.warn('TERMINAL:AUTO_PULL_WARN', `Auto-pull trigger error: ${err.message}`);
     }
+  }
+
+  // Records whichever Claude/Gemini CLI session ids are currently active as a pair, so
+  // resuming the Claude side later can automatically bring its Gemini side back too.
+  _recordSessionPairing() {
+    try {
+      const claudeId = this.terminalManager.getStatus('claude').cliSessionId;
+      const geminiId = this.terminalManager.getStatus('gemini').cliSessionId;
+      this.sessionPairings.recordActive({ claudeSessionId: claudeId, geminiSessionId: geminiId });
+    } catch (err) {
+      logger.warn('SESSION_PAIRINGS:RECORD_ERROR', `Failed to record session pairing: ${err.message}`);
+    }
+  }
+
+  // Merges persisted pairing metadata with each CLI's own live, authoritative session
+  // store (CliSessionRegistry), so the list only ever offers sessions that genuinely
+  // exist and are genuinely resumable -- a pairing entry referencing an id neither CLI
+  // actually persisted (e.g. a terminal opened and closed with no real exchange) is
+  // dropped rather than shown as a dead "ghost" entry.
+  async _buildMergedSessionList() {
+    const [realSessions, pairs] = await Promise.all([
+      this.cliSessionRegistry.list(),
+      Promise.resolve(this.sessionPairings.list())
+    ]);
+
+    const realClaudeById = new Map(realSessions.filter((s) => s.agent === 'claude').map((s) => [s.id, s]));
+    const realGeminiById = new Map(realSessions.filter((s) => s.agent === 'gemini').map((s) => [s.id, s]));
+
+    const merged = [];
+    const usedGeminiIds = new Set();
+
+    for (const pair of pairs) {
+      const claudeReal = pair.claudeSessionId ? realClaudeById.get(pair.claudeSessionId) : null;
+      const geminiReal = pair.geminiSessionId ? realGeminiById.get(pair.geminiSessionId) : null;
+      if (!claudeReal && !geminiReal) continue; // neither side ever actually persisted -- drop
+
+      if (geminiReal) usedGeminiIds.add(geminiReal.id);
+
+      merged.push({
+        claudeSessionId: claudeReal ? claudeReal.id : null,
+        geminiSessionId: geminiReal ? geminiReal.id : null,
+        title: claudeReal ? claudeReal.title : geminiReal.title,
+        lastActiveAt: [claudeReal?.lastActiveAt, geminiReal?.lastActiveAt].filter(Boolean).sort().pop()
+      });
+    }
+
+    // Any real Gemini session not referenced by any pair is one that was never paired
+    // with a Claude session at all -- i.e. genuinely used standalone -- and gets its
+    // own entry per the user's own framing of this feature.
+    for (const [id, s] of realGeminiById) {
+      if (!usedGeminiIds.has(id)) {
+        merged.push({ claudeSessionId: null, geminiSessionId: id, title: s.title, lastActiveAt: s.lastActiveAt });
+      }
+    }
+
+    merged.sort((a, b) => new Date(b.lastActiveAt).getTime() - new Date(a.lastActiveAt).getTime());
+    return merged;
   }
 
   _handleGeminiApprovalPrompt(snapshot) {
@@ -400,6 +461,7 @@ export class WorkbenchServer {
 
         // Start or attach to existing terminal with scrollback replay
         this.terminalManager.startTerminal(terminalId, { cols: 80, rows: 24 }, currentDataHandler, currentExitHandler);
+        this._recordSessionPairing();
         this.broadcastEvent('terminal_status', this.terminalManager.getAllStatuses());
       };
 
@@ -597,8 +659,10 @@ export class WorkbenchServer {
 
         if (action === 'start') {
           this.terminalManager.startTerminal(termId);
+          this._recordSessionPairing();
         } else if (action === 'restart') {
           await this.terminalManager.restartTerminal(termId);
+          this._recordSessionPairing();
         } else if (action === 'terminate') {
           await this.terminalManager.terminate(termId);
         }
@@ -620,6 +684,55 @@ export class WorkbenchServer {
           action,
           error: err.message
         });
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: err.message }));
+      }
+    }
+
+    // 3b. CLI session history: Claude sessions are the primary unit; a Gemini session
+    // Claude delegated to is merged under its paired Claude session rather than listed
+    // separately, and only appears on its own when it was genuinely used standalone.
+    if (pathname === '/api/sessions' && req.method === 'GET') {
+      try {
+        const sessions = await this._buildMergedSessionList();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ sessions }));
+      } catch (err) {
+        logger.warn('API:SESSIONS_LIST_ERROR', `Failed to build session list: ${err.message}`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ sessions: [] }));
+      }
+    }
+
+    if (pathname === '/api/sessions/resume' && req.method === 'POST') {
+      try {
+        const body = await this._readBody(req, res);
+        const { claudeSessionId, geminiSessionId } = JSON.parse(body || '{}');
+        if (!claudeSessionId && !geminiSessionId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'claudeSessionId and/or geminiSessionId is required' }));
+        }
+
+        logger.info('API:SESSION_RESUME_REQUEST', 'Resuming session', { claudeSessionId, geminiSessionId });
+
+        // Resume whichever side(s) this session actually has -- one click restores the
+        // whole work session, not just the terminal the user happened to click from.
+        if (claudeSessionId) {
+          await this.terminalManager.restartTerminal('claude', { resumeSessionId: claudeSessionId });
+        }
+        if (geminiSessionId) {
+          await this.terminalManager.restartTerminal('gemini', { resumeSessionId: geminiSessionId });
+        }
+        this._recordSessionPairing();
+
+        this.broadcastEvent('terminal_status', this.terminalManager.getAllStatuses());
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          claude: claudeSessionId ? this.terminalManager.getStatus('claude') : null,
+          gemini: geminiSessionId ? this.terminalManager.getStatus('gemini') : null
+        }));
+      } catch (err) {
+        logger.error('API:SESSION_RESUME_ERROR', `Session resume failed: ${err.message}`, { error: err.message });
         res.writeHead(400, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: err.message }));
       }

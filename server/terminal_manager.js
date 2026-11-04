@@ -3,6 +3,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import pty from '@homebridge/node-pty-prebuilt-multiarch';
 import { ProcessManager } from '../core/process_manager.js';
 import { logger } from './logger.js';
@@ -111,12 +112,23 @@ export class TerminalManager {
     });
   }
 
-  getTerminalConfig(id, targetCwd = null) {
+  // sessionOpts: { sessionId, resumeSessionId }. Both Claude Code and Gemini CLI accept
+  // --session-id <uuid> to assign a known id to a brand-new conversation, and
+  // --resume <id> to reopen a past one -- confirmed against both CLIs' own --help output
+  // and (for Gemini) by live-resuming a real session in this workbench and getting an
+  // accurate recollection of the original conversation back.
+  getTerminalConfig(id, targetCwd = null, sessionOpts = {}) {
     const resolvedCwd = targetCwd || this.projectCwd || this.cwd;
     const bridgeScript = path.join(__serverDir, 'mcp', 'workbench_mcp_bridge.js');
+    const { sessionId = null, resumeSessionId = null } = sessionOpts;
 
     if (id === 'claude') {
       const args = [];
+      if (resumeSessionId) {
+        args.push('--resume', resumeSessionId);
+      } else if (sessionId) {
+        args.push('--session-id', sessionId);
+      }
       if (this.workbenchPort && this.sessionToken) {
         const mcpDir = path.join(resolvedCwd, '.workbench');
         try {
@@ -162,6 +174,11 @@ export class TerminalManager {
     } else if (id === 'gemini') {
       const bundlePath = resolveGeminiBundlePath();
       const args = bundlePath ? [bundlePath, '--skip-trust'] : ['--skip-trust'];
+      if (resumeSessionId) {
+        args.push('--resume', resumeSessionId);
+      } else if (sessionId) {
+        args.push('--session-id', sessionId);
+      }
       if (this.workbenchPort && this.sessionToken) {
         const geminiDir = path.join(resolvedCwd, '.gemini');
         try {
@@ -213,7 +230,7 @@ export class TerminalManager {
     }
   }
 
-  startTerminal(id, { cols = 80, rows = 24, cwd = null } = {}, onData, onExit) {
+  startTerminal(id, { cols = 80, rows = 24, cwd = null, resumeSessionId = null } = {}, onData, onExit) {
     let term = this.terminals.get(id);
 
     if (term && term.status === 'RUNNING') {
@@ -238,29 +255,48 @@ export class TerminalManager {
     }
 
     const targetCwd = cwd || this.projectCwd || this.cwd;
-    const config = this.getTerminalConfig(id, targetCwd);
+    // Only 'claude' and 'gemini' have a resumable CLI conversation concept; every fresh
+    // launch of either still gets a known id assigned up front (rather than letting the
+    // CLI pick one silently) so it can show up in the session list right away.
+    const isCliAgent = id === 'claude' || id === 'gemini';
+    const newSessionId = (!resumeSessionId && isCliAgent) ? crypto.randomUUID() : null;
+    const config = this.getTerminalConfig(id, targetCwd, { sessionId: newSessionId, resumeSessionId });
+    const cliSessionId = resumeSessionId || newSessionId;
 
     logger.info('TERMINAL:SPAWN', `Spawning ${id} ConPTY in directory: ${targetCwd}`, {
       id,
       file: config.file,
       cwd: targetCwd,
       cols,
-      rows
+      rows,
+      cliSessionId,
+      resumed: !!resumeSessionId
     });
 
-    // Spawn ConPTY process with explicit target working directory
+    // Spawn ConPTY process with explicit target working directory. Strip any
+    // CLAUDE_CODE_* env vars inherited from whatever process launched this workbench
+    // (e.g. running `npm start` from inside a Claude Code session/terminal) -- without
+    // this, a spawned 'claude' terminal can inherit CLAUDE_CODE_CHILD_SESSION /
+    // CLAUDE_CODE_SESSION_ID and treat itself as a child of that outer session instead
+    // of starting its own independent, --session-id/--resume-able conversation.
+    const childEnv = { ...process.env };
+    for (const key of Object.keys(childEnv)) {
+      if (key.startsWith('CLAUDE_CODE_')) delete childEnv[key];
+    }
+
     const ptyProcess = pty.spawn(config.file, config.args, {
       name: 'xterm-256color',
       cols: Math.max(20, cols),
       rows: Math.max(5, rows),
       cwd: targetCwd,
-      env: process.env
+      env: childEnv
     });
 
     const terminalRecord = {
       id,
       ptyProcess,
       pid: ptyProcess.pid,
+      cliSessionId,
       cwd: targetCwd,
       status: 'RUNNING',
       cols,
@@ -325,7 +361,7 @@ export class TerminalManager {
     return terminalRecord;
   }
 
-  async restartTerminal(id, { cols = 80, rows = 24, cwd = null } = {}, onData, onExit) {
+  async restartTerminal(id, { cols = 80, rows = 24, cwd = null, resumeSessionId = null } = {}, onData, onExit) {
     const existing = this.terminals.get(id);
     const savedDataListeners = existing ? new Set(existing.dataListeners) : new Set();
     const savedExitListeners = existing ? new Set(existing.exitListeners) : new Set();
@@ -337,13 +373,14 @@ export class TerminalManager {
       id,
       oldPid: existing?.pid,
       oldCwd: existing?.cwd,
-      targetCwd: cwd || this.projectCwd || this.cwd
+      targetCwd: cwd || this.projectCwd || this.cwd,
+      resumeSessionId
     });
 
     await this.terminate(id);
 
     const targetCwd = cwd || this.projectCwd || this.cwd;
-    const newTerm = this.startTerminal(id, { cols, rows, cwd: targetCwd });
+    const newTerm = this.startTerminal(id, { cols, rows, cwd: targetCwd, resumeSessionId });
 
     // Re-attach active listeners from previous session
     for (const l of savedDataListeners) {
@@ -477,7 +514,7 @@ export class TerminalManager {
 
   getStatus(id) {
     const term = this.terminals.get(id);
-    if (!term) return { id, status: 'NOT_STARTED', pid: null, cwd: this.projectCwd || this.cwd };
+    if (!term) return { id, status: 'NOT_STARTED', pid: null, cwd: this.projectCwd || this.cwd, cliSessionId: null };
     return {
       id: term.id,
       status: term.status,
@@ -486,7 +523,8 @@ export class TerminalManager {
       cols: term.cols,
       rows: term.rows,
       startTime: term.startTime,
-      exitCode: term.exitCode
+      exitCode: term.exitCode,
+      cliSessionId: term.cliSessionId || null
     };
   }
 

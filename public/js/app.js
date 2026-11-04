@@ -8,6 +8,7 @@ import { ActivityViewController } from './activity_view.js';
 import { dialogService } from './dialog_service.js';
 import { getIcon, initIcons } from './icons.js';
 import { PaneLayoutController } from './pane_layout.js';
+import { SessionsViewController } from './sessions_view.js';
 
 function extractAndClearToken() {
   const hash = window.location.hash;
@@ -78,6 +79,13 @@ class WorkbenchApp {
       token: this.token,
       onStatusChange: (statuses) => this.terminalView.updateProcessStatuses(statuses)
     });
+
+    this.sessionsView = new SessionsViewController({
+      token: this.token,
+      onToast: (msg, type) => this.activityView.toast(msg, type),
+      onResumed: (agent) => this.terminalView.switchTab(agent)
+    });
+    this.sessionsView.init();
 
     this.terminalView.init();
     await this.taskView.loadInitialTasks();
