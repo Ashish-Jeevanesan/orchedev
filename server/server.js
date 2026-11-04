@@ -177,11 +177,24 @@ export class WorkbenchServer {
       // Named handover instead of the old ambiguous "check queue" text: tells Gemini
       // exactly which task and which tools to call, rather than relying on it to infer
       // intent from an unrecognized phrase.
-      const handoverMessage = `A new task is waiting in your inbox (correlationId: ${targetTask.correlationId}). Call get_inbox to see it, then claim_task to pick it up.\r`;
+      const handoverMessage = `A new task is waiting in your inbox (correlationId: ${targetTask.correlationId}). Call get_inbox to see it, then claim_task to pick it up.`;
       logger.info('TERMINAL:AUTO_PULL', `Notifying Gemini ConPTY of queued task ${targetTask.correlationId}`, {
         correlationId: targetTask.correlationId
       });
+      // Write the text and the submitting Enter as two separate writes with a short
+      // gap. A single write() containing the text plus a trailing \r arrives as one
+      // chunk with no inter-character timing -- Gemini's ink-based input treats that
+      // shape as a paste, which inserts the content but does NOT auto-submit it (the
+      // user has to press Enter themselves). Splitting it mirrors real typing closely
+      // enough that the terminal treats the final \r as a genuine submit keystroke.
       this.terminalManager.write('gemini', handoverMessage);
+      setTimeout(() => {
+        try {
+          this.terminalManager.write('gemini', '\r');
+        } catch (err) {
+          logger.warn('TERMINAL:AUTO_PULL_WARN', `Failed to submit handover message: ${err.message}`);
+        }
+      }, 150);
     } catch (err) {
       logger.warn('TERMINAL:AUTO_PULL_WARN', `Auto-pull trigger error: ${err.message}`);
     }
