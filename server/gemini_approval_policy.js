@@ -82,6 +82,10 @@ function isEditApprovalPrompt(promptText) {
   return /Apply this change\?/i.test(promptText);
 }
 
+function isSkillActivationPrompt(promptText) {
+  return /Activate Skill/i.test(promptText) && /Do you want to proceed\?/i.test(promptText);
+}
+
 // Gemini's prompt renders the requested command in a box above the Yes/No menu, e.g.
 // "Shell  Get-ChildItem -Path "...""; this is a best-effort extraction, not a parser --
 // if it can't confidently find the command, evaluate() escalates rather than guessing.
@@ -93,6 +97,11 @@ function extractRequestedCommand(promptText) {
 // Edit confirmations print "Target: <fileName>" alongside the diff.
 function extractEditTarget(promptText) {
   const match = promptText.match(/Target:\s*([^\n\r]+)/i);
+  return match ? match[1].trim() : null;
+}
+
+function extractSkillName(promptText) {
+  const match = promptText.match(/Activate Skill\s+"([^"]+)"/i);
   return match ? match[1].trim() : null;
 }
 
@@ -161,6 +170,21 @@ function evaluateEditPrompt(promptText, context) {
   return { isPrompt: true, decision: 'ESCALATE', reason: 'no-matching-claude-delegated-task', command: fileName };
 }
 
+function evaluateSkillActivationPrompt(promptText) {
+  if (containsUntrustedMarker(promptText)) {
+    return { isPrompt: true, decision: 'ESCALATE', reason: 'untrusted-input-marker' };
+  }
+
+  // Activating a skill means reading a file the user already installed on disk
+  // themselves (e.g. C:\Users\<user>\.agents\skills\<name>\SKILL.md) -- a local read,
+  // not a shell execution or a write -- so it's auto-approved categorically, the same
+  // way Claude Code itself doesn't ask per-use before loading a locally installed
+  // skill. Always answers "1. Allow once" (least standing privilege) rather than
+  // "Allow for this session", so each activation is re-evaluated fresh.
+  const skillName = extractSkillName(promptText);
+  return { isPrompt: true, decision: 'AUTO_APPROVE', reason: 'skill-activation', command: skillName };
+}
+
 /**
  * @param {string} promptText - a quiet-output snapshot of the Gemini terminal's raw
  *   PTY output (may include ANSI escape sequences).
@@ -175,6 +199,9 @@ export function evaluate(promptText, context = {}) {
   }
   if (isShellApprovalPrompt(promptText)) {
     return evaluateShellPrompt(promptText);
+  }
+  if (isSkillActivationPrompt(promptText)) {
+    return evaluateSkillActivationPrompt(promptText);
   }
   return { isPrompt: false };
 }
