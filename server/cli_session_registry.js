@@ -101,12 +101,112 @@ export class CliSessionRegistry {
     }
   }
 
-  _listGemini() {
+  _listGeminiFromDisk() {
+    try {
+      const geminiTmp = path.join(os.homedir(), '.gemini', 'tmp');
+      if (!fs.existsSync(geminiTmp)) return null;
+
+      const normCwd = path.resolve(this.cwd).toLowerCase();
+      const sessions = [];
+
+      const dirs = fs.readdirSync(geminiTmp);
+      for (const dir of dirs) {
+        const fullDir = path.join(geminiTmp, dir);
+        try {
+          if (!fs.statSync(fullDir).isDirectory()) continue;
+        } catch (e) {
+          continue;
+        }
+
+        const rootFile = path.join(fullDir, '.project_root');
+        if (!fs.existsSync(rootFile)) continue;
+
+        let rootPath = '';
+        try {
+          rootPath = path.resolve(fs.readFileSync(rootFile, 'utf8').trim()).toLowerCase();
+        } catch (e) {
+          continue;
+        }
+
+        if (rootPath !== normCwd) continue;
+
+        const chatsDir = path.join(fullDir, 'chats');
+        if (!fs.existsSync(chatsDir)) continue;
+
+        const files = fs.readdirSync(chatsDir).filter((f) => f.endsWith('.jsonl'));
+        for (const f of files) {
+          const fullPath = path.join(chatsDir, f);
+          let fileStat;
+          try {
+            fileStat = fs.statSync(fullPath);
+          } catch (e) {
+            continue;
+          }
+
+          let sessionId = null;
+          let title = null;
+
+          try {
+            const content = fs.readFileSync(fullPath, 'utf8');
+            const lines = content.split('\n').filter(Boolean);
+            if (lines.length > 0) {
+              try {
+                const first = JSON.parse(lines[0]);
+                sessionId = first.sessionId || null;
+              } catch (e) {}
+            }
+            for (const line of lines) {
+              let obj;
+              try {
+                obj = JSON.parse(line);
+              } catch (e) {
+                continue;
+              }
+              if (obj?.$set?.summary) {
+                title = obj.$set.summary;
+                break;
+              }
+              if (!title && obj?.type === 'user' && Array.isArray(obj.content)) {
+                for (const part of obj.content) {
+                  const txt = part?.text;
+                  if (txt && typeof txt === 'string' && !txt.trim().startsWith('<')) {
+                    title = txt.trim().slice(0, 120);
+                    break;
+                  }
+                }
+              }
+            }
+          } catch (e) {}
+
+          if (sessionId) {
+            sessions.push({
+              id: sessionId,
+              agent: 'gemini',
+              title: title || `Gemini session — ${fileStat.mtime.toLocaleString()}`,
+              lastActiveAt: fileStat.mtime.toISOString()
+            });
+          }
+        }
+      }
+
+      return sessions;
+    } catch (e) {
+      logger.warn('CLI_SESSIONS:GEMINI_DISK_READ_FAILED', `Failed reading Gemini sessions from disk: ${e.message}`);
+      return null;
+    }
+  }
+
+  async _listGemini() {
+    const diskSessions = this._listGeminiFromDisk();
+    if (diskSessions && diskSessions.length > 0) {
+      return diskSessions;
+    }
+
     return new Promise((resolve) => {
-      execFile('gemini', ['--list-sessions'], { cwd: this.cwd, timeout: 10000, windowsHide: true, shell: true }, (err, stdout) => {
+      execFile('gemini', ['--list-sessions'], { cwd: this.cwd, timeout: 5000, windowsHide: true, shell: true }, (err, stdout) => {
         if (err || !stdout) {
           if (err) logger.warn('CLI_SESSIONS:GEMINI_LIST_FAILED', `Failed to list Gemini sessions: ${err.message}`);
-          return resolve([]);
+          return resolve(diskSessions || []);
         }
         // Gemini's own output, e.g.: "  2. Compare slides (4 minutes ago) [uuid]"
         const re = /^\s*(\d+)\.\s+(.+?)\s+\(([^)]+)\)\s+\[([0-9a-fA-F-]{36})\]\s*$/;

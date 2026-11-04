@@ -55,6 +55,20 @@ export class TerminalManager {
     // terminalRecord so listeners survive a restartTerminal() recreating the record.
     this._outputWatch = new Map(); // id -> { buffer: '', timer: null, lastDataAt: 0 }
     this._quietListeners = new Map(); // id -> Set<(bufferSnapshot: string) => void>
+    this._globalExitListeners = new Set();
+  }
+
+  clearScrollback(id) {
+    const term = this.terminals.get(id);
+    if (term) {
+      term.scrollbackBuffer = '';
+    }
+  }
+
+  onGlobalExit(listener) {
+    if (typeof listener === 'function') {
+      this._globalExitListeners.add(listener);
+    }
   }
 
   // Register a listener fired with a bounded snapshot of recent raw PTY output once
@@ -198,6 +212,8 @@ export class TerminalManager {
             this.generatedFiles.add(settingsPath);
           }
           settings.mcpServers = settings.mcpServers || {};
+          settings.ui = settings.ui || {};
+          settings.ui.useAlternateBuffer = true;
           settings.mcpServers.workbench = {
             command: 'node',
             args: [
@@ -347,6 +363,12 @@ export class TerminalManager {
       for (const listener of terminalRecord.exitListeners) {
         try {
           listener(exitCode, signal);
+        } catch (e) {}
+      }
+
+      for (const listener of this._globalExitListeners) {
+        try {
+          listener(id, exitCode, signal);
         } catch (e) {}
       }
     });

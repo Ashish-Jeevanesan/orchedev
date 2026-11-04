@@ -52,6 +52,7 @@ export class TerminalViewController {
       cursorBlink: true,
       fontSize: 13,
       fontFamily: 'Consolas, "Cascadia Code", "JetBrains Mono", monospace',
+      scrollOnUserInput: true,
       theme: {
         background: '#000000',
         foreground: '#e2e8f0',
@@ -70,6 +71,11 @@ export class TerminalViewController {
     sess.fitAddon = fitAddon;
 
     term.onData((data) => {
+      // Intercept Ctrl+L (\x0c) to perform clean client + server buffer reset
+      if (data === '\x0c') {
+        this.clearActiveBuffer();
+        return;
+      }
       if (sess.ws && sess.ws.readyState === WebSocket.OPEN) {
         sess.ws.send(JSON.stringify({ type: 'input', data }));
       }
@@ -172,13 +178,17 @@ export class TerminalViewController {
       try {
         const msg = JSON.parse(event.data);
         if (msg.type === 'output' && msg.data) {
-          sess.term.write(msg.data);
+          sess.term.write(msg.data, () => {
+            sess.term.scrollToBottom();
+          });
         } else if (msg.type === 'exit') {
           sess.term.writeln(`\r\n\x1b[33m[Process exited with code ${msg.exitCode}]\x1b[0m\r\n`);
           sess.isRunning = false;
         }
       } catch (e) {
-        sess.term.write(event.data);
+        sess.term.write(event.data, () => {
+          sess.term.scrollToBottom();
+        });
       }
     };
 
@@ -258,13 +268,20 @@ export class TerminalViewController {
     }
   }
 
-  clearActiveBuffer() {
-    const sess = this.sessions[this.activeTab];
+  clearBuffer(id) {
+    const sess = this.sessions[id];
     if (sess && sess.term) {
-      // Clear visible xterm display and scrollback buffer only (no PTY stdin input sent)
-      sess.term.clear();
+      sess.term.reset();
+      if (sess.ws && sess.ws.readyState === WebSocket.OPEN) {
+        sess.ws.send(JSON.stringify({ type: 'input', data: '\x0c' }));
+      }
+      sess.term.scrollToBottom();
       sess.term.focus();
     }
+  }
+
+  clearActiveBuffer() {
+    this._callTermAction(this.activeTab, 'clear');
   }
 
   _bindControls() {
@@ -289,6 +306,7 @@ export class TerminalViewController {
         icon: 'rotate-cw'
       });
       if (confirmed) {
+        this.clearBuffer(this.activeTab);
         this._callTermAction(this.activeTab, 'restart');
       }
     });
@@ -345,6 +363,15 @@ export class TerminalViewController {
         if (sess && sess.ws) {
           try { sess.ws.close(); } catch(e){}
           sess.ws = null;
+        }
+      } else if (action === 'clear') {
+        if (sess && sess.term) {
+          sess.term.reset();
+          if (sess.ws && sess.ws.readyState === WebSocket.OPEN) {
+            sess.ws.send(JSON.stringify({ type: 'input', data: '\x0c' }));
+          }
+          sess.term.scrollToBottom();
+          sess.term.focus();
         }
       }
 

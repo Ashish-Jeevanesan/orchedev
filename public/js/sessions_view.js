@@ -32,6 +32,7 @@ export class SessionsViewController {
     this.filterTabsEl = document.getElementById('sessions-filter-tabs');
     this.currentFilter = 'all';
     this.sessions = [];
+    this.isLoading = false;
   }
 
   init() {
@@ -81,17 +82,22 @@ export class SessionsViewController {
   }
 
   async _loadSessions() {
-    this.listEl.innerHTML = '<div class="empty-state">Loading...</div>';
+    this.isLoading = true;
+    this.listEl.innerHTML = '<div class="empty-state">Loading sessions...</div>';
     try {
       const res = await fetch('/api/sessions', {
         headers: { 'X-Session-Token': this.token }
       });
       const data = await res.json();
       this.sessions = Array.isArray(data.sessions) ? data.sessions : [];
-      this._render();
     } catch (err) {
+      this.sessions = [];
       this.listEl.innerHTML = `<div class="empty-state">Failed to load sessions: ${this._escape(err.message)}</div>`;
+      return;
+    } finally {
+      this.isLoading = false;
     }
+    this._render();
   }
 
   // 'all' | 'claude' (has a claude session, with or without paired gemini) |
@@ -105,6 +111,11 @@ export class SessionsViewController {
   }
 
   _render() {
+    if (this.isLoading) {
+      this.listEl.innerHTML = '<div class="empty-state">Loading sessions...</div>';
+      return;
+    }
+
     const filtered = this.sessions.filter((s) => this._matchesFilter(s));
 
     if (filtered.length === 0) {

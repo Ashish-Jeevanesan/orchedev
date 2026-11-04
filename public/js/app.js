@@ -83,7 +83,12 @@ class WorkbenchApp {
     this.sessionsView = new SessionsViewController({
       token: this.token,
       onToast: (msg, type) => this.activityView.toast(msg, type),
-      onResumed: (agent) => this.terminalView.switchTab(agent)
+      onResumed: (agent) => {
+        if (this.terminalView) {
+          this.terminalView.clearBuffer(agent);
+          this.terminalView.switchTab(agent);
+        }
+      }
     });
     this.sessionsView.init();
 

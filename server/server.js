@@ -57,6 +57,9 @@ export class WorkbenchServer {
     this.cliSessionRegistry = new CliSessionRegistry({ cwd });
     this.sessionPairings = new SessionPairings({ cwd });
     this.terminalManager = new TerminalManager({ cwd });
+    this.terminalManager.onGlobalExit(() => {
+      this._recordSessionPairing();
+    });
     this.coordinatorService = null;
     this.workspaceAuth = new WorkspaceAuthorizationService({ baseCwd: cwd });
     this.intercomService = null;
@@ -227,6 +230,7 @@ export class WorkbenchServer {
     const realGeminiById = new Map(realSessions.filter((s) => s.agent === 'gemini').map((s) => [s.id, s]));
 
     const merged = [];
+    const usedClaudeIds = new Set();
     const usedGeminiIds = new Set();
 
     for (const pair of pairs) {
@@ -234,6 +238,7 @@ export class WorkbenchServer {
       const geminiReal = pair.geminiSessionId ? realGeminiById.get(pair.geminiSessionId) : null;
       if (!claudeReal && !geminiReal) continue; // neither side ever actually persisted -- drop
 
+      if (claudeReal) usedClaudeIds.add(claudeReal.id);
       if (geminiReal) usedGeminiIds.add(geminiReal.id);
 
       merged.push({
@@ -242,6 +247,14 @@ export class WorkbenchServer {
         title: claudeReal ? claudeReal.title : geminiReal.title,
         lastActiveAt: [claudeReal?.lastActiveAt, geminiReal?.lastActiveAt].filter(Boolean).sort().pop()
       });
+    }
+
+    // Any real Claude session not referenced by any pair gets its own entry so it is
+    // never dropped on restart, termination, or buffer clearing.
+    for (const [id, s] of realClaudeById) {
+      if (!usedClaudeIds.has(id)) {
+        merged.push({ claudeSessionId: id, geminiSessionId: null, title: s.title, lastActiveAt: s.lastActiveAt });
+      }
     }
 
     // Any real Gemini session not referenced by any pair is one that was never paired
@@ -516,6 +529,7 @@ export class WorkbenchServer {
 
       ws.on('close', () => {
         if (authTimer) clearTimeout(authTimer);
+        this._recordSessionPairing();
         if (currentDataHandler || currentExitHandler) {
           this.terminalManager.detachListener(terminalId, currentDataHandler, currentExitHandler);
         }
@@ -658,7 +672,7 @@ export class WorkbenchServer {
     }
 
     // 3. Terminals control
-    const termActionMatch = pathname.match(/^\/api\/terminals\/([a-zA-Z0-9_-]+)\/(start|restart|terminate)$/);
+    const termActionMatch = pathname.match(/^\/api\/terminals\/([a-zA-Z0-9_-]+)\/(start|restart|terminate|clear)$/);
     if (termActionMatch && req.method === 'POST') {
       const termId = termActionMatch[1];
       const action = termActionMatch[2];
@@ -674,10 +688,14 @@ export class WorkbenchServer {
           this.terminalManager.startTerminal(termId);
           this._recordSessionPairing();
         } else if (action === 'restart') {
+          this._recordSessionPairing();
           await this.terminalManager.restartTerminal(termId);
           this._recordSessionPairing();
         } else if (action === 'terminate') {
+          this._recordSessionPairing();
           await this.terminalManager.terminate(termId);
+        } else if (action === 'clear') {
+          this.terminalManager.clearScrollback(termId);
         }
 
         const status = this.terminalManager.getStatus(termId);
@@ -1251,6 +1269,7 @@ export class WorkbenchServer {
 
   async shutdown() {
     console.log('[WorkbenchServer] Shutting down server and all child processes...');
+    this._recordSessionPairing();
 
     if (this._autoPullInterval) {
       clearInterval(this._autoPullInterval);
