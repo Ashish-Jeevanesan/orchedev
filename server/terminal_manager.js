@@ -49,6 +49,52 @@ export class TerminalManager {
     this.generatedFiles = new Set();
     this.preExistingConfigs = new Map(); // filePath -> originalStringContent
     this.activeInstanceIds = new Map(); // id -> instanceId
+
+    // Debounced "output has gone quiet" tracking per terminal id, independent of
+    // terminalRecord so listeners survive a restartTerminal() recreating the record.
+    this._outputWatch = new Map(); // id -> { buffer: '', timer: null, lastDataAt: 0 }
+    this._quietListeners = new Map(); // id -> Set<(bufferSnapshot: string) => void>
+  }
+
+  // Register a listener fired with a bounded snapshot of recent raw PTY output once
+  // that terminal's output has gone quiet for ~500ms. Used for things that need to
+  // read a fully-drawn prompt/screen rather than a single arbitrary data chunk.
+  onQuietOutput(id, listener) {
+    if (!this._quietListeners.has(id)) this._quietListeners.set(id, new Set());
+    this._quietListeners.get(id).add(listener);
+  }
+
+  // True if no PTY output has been received for this terminal in the last quietMs.
+  // Used to avoid injecting synthetic input while the agent is mid-output.
+  isIdle(id, quietMs = 500) {
+    const w = this._outputWatch.get(id);
+    if (!w || !w.lastDataAt) return true;
+    return (Date.now() - w.lastDataAt) >= quietMs;
+  }
+
+  _feedOutputWatch(id, chunk) {
+    const listeners = this._quietListeners.get(id);
+    if (!this._outputWatch.has(id)) {
+      this._outputWatch.set(id, { buffer: '', timer: null, lastDataAt: 0 });
+    }
+    const w = this._outputWatch.get(id);
+    w.lastDataAt = Date.now();
+
+    if (!listeners || listeners.size === 0) return; // nothing to assemble a buffer for
+
+    w.buffer += chunk;
+    const MAX_WATCH_BYTES = 8192;
+    if (w.buffer.length > MAX_WATCH_BYTES) {
+      w.buffer = w.buffer.slice(-MAX_WATCH_BYTES);
+    }
+
+    if (w.timer) clearTimeout(w.timer);
+    w.timer = setTimeout(() => {
+      const snapshot = w.buffer;
+      for (const fn of listeners) {
+        try { fn(snapshot); } catch (e) {}
+      }
+    }, 500);
   }
 
   setWorkbenchConnection({ port, sessionToken }) {
@@ -242,6 +288,9 @@ export class TerminalManager {
           listener(data);
         } catch (e) {}
       }
+
+      // 3. Feed the debounced quiet-output watch (approval-prompt detection, idle checks)
+      this._feedOutputWatch(id, data);
     });
 
     ptyProcess.onExit(({ exitCode, signal }) => {

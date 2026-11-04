@@ -12,6 +12,7 @@ import { TaskCoordinatorService } from './task_coordinator_service.js';
 import { IntercomService, TaskSecurityError } from './intercom_service.js';
 import { WorkspaceAuthorizationService } from './workspace_authorization.js';
 import { logger } from './logger.js';
+import { evaluate as evaluateGeminiApprovalPrompt } from './gemini_approval_policy.js';
 import { fileURLToPath as __toPath } from 'url';
 const __serverDir = path.dirname(__toPath(import.meta.url));
 
@@ -61,6 +62,7 @@ export class WorkbenchServer {
     this._autoPullInterval = null;
     this._lastAutoPulledTaskId = null;
     this._lastAutoPullTime = 0;
+    this._lastApprovalSnapshot = null;
   }
 
   async start() {
@@ -97,10 +99,16 @@ export class WorkbenchServer {
         this.terminalManager.getTerminalConfig('gemini');
         console.log(`[WorkbenchServer] Listening strictly on 127.0.0.1:${this.allocatedPort}`);
 
-        // Recurring 15-second auto-pull check for Gemini worker terminal
+        // Recurring 15-second auto-pull check for Gemini worker terminal (fallback poll;
+        // task_state_changed already triggers this immediately -- see broadcastEvent())
         this._autoPullInterval = setInterval(() => {
           this._checkAndTriggerAutoPull();
         }, 15000);
+
+        // Scoped, logged auto-approval for Gemini's own permission prompts -- see
+        // gemini_approval_policy.js for the rules. Never acts on anything flagged as
+        // carrying untrusted input; those are always left for the human.
+        this.terminalManager.onQuietOutput('gemini', (snapshot) => this._handleGeminiApprovalPrompt(snapshot));
 
         resolve({
           port: this.allocatedPort,
@@ -148,14 +156,56 @@ export class WorkbenchServer {
         return;
       }
 
+      // Don't interleave with Gemini's own live output or an open permission prompt --
+      // if it's mid-output, skip this tick; the 15s fallback poll (or the next
+      // task_state_changed event) will retry once it goes idle. Only a successful
+      // write below marks the task as "already notified".
+      if (!this.terminalManager.isIdle('gemini')) {
+        return;
+      }
+
       this._lastAutoPulledTaskId = targetTask.correlationId;
       this._lastAutoPullTime = now;
-      logger.info('TERMINAL:AUTO_PULL', `Auto-triggering 'check queue' into Gemini ConPTY for queued task ${targetTask.correlationId}`, {
+      // Named handover instead of the old ambiguous "check queue" text: tells Gemini
+      // exactly which task and which tools to call, rather than relying on it to infer
+      // intent from an unrecognized phrase.
+      const handoverMessage = `A new task is waiting in your inbox (correlationId: ${targetTask.correlationId}). Call get_inbox to see it, then claim_task to pick it up.\r`;
+      logger.info('TERMINAL:AUTO_PULL', `Notifying Gemini ConPTY of queued task ${targetTask.correlationId}`, {
         correlationId: targetTask.correlationId
       });
-      this.terminalManager.write('gemini', 'check queue\r');
+      this.terminalManager.write('gemini', handoverMessage);
     } catch (err) {
       logger.warn('TERMINAL:AUTO_PULL_WARN', `Auto-pull trigger error: ${err.message}`);
+    }
+  }
+
+  _handleGeminiApprovalPrompt(snapshot) {
+    try {
+      const result = evaluateGeminiApprovalPrompt(snapshot);
+      if (!result.isPrompt) return;
+
+      if (result.decision === 'AUTO_APPROVE') {
+        if (this._lastApprovalSnapshot === snapshot) return; // cheap guard against re-firing on an unchanged buffer
+        this._lastApprovalSnapshot = snapshot;
+        this.terminalManager.write('gemini', '1\r');
+        logger.info('GEMINI_APPROVAL:AUTO_APPROVED', `Auto-approved Gemini permission prompt (category: ${result.reason})`, {
+          command: result.command,
+          reason: result.reason
+        });
+        this.broadcastEvent('gemini_approval', {
+          decision: 'AUTO_APPROVED',
+          command: result.command,
+          reason: result.reason,
+          timestamp: Date.now()
+        });
+      } else {
+        logger.info('GEMINI_APPROVAL:ESCALATED', `Left Gemini permission prompt for human review (${result.reason})`, {
+          command: result.command || null,
+          reason: result.reason
+        });
+      }
+    } catch (err) {
+      logger.warn('GEMINI_APPROVAL:HANDLER_ERROR', `Approval prompt handler error: ${err.message}`);
     }
   }
 
