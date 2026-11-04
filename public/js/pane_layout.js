@@ -74,7 +74,11 @@ export class PaneLayoutController {
       this.collapsedTerminalLabel.addEventListener('click', () => this.toggle('terminal'));
     }
 
-    window.addEventListener('resize', () => this._fitTerminal());
+    // Note: no native window 'resize' listener here. terminal_view.js already listens
+    // for real window resizes and re-fits xterm on its own; this controller only needs
+    // to trigger that same re-fit after a drag/toggle, via _fitTerminal(). Listening for
+    // 'resize' here too would re-trigger on the synthetic event _fitTerminal() dispatches,
+    // recursing forever.
   }
 
   toggle(pane) {
