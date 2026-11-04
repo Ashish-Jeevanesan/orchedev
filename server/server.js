@@ -63,6 +63,10 @@ export class WorkbenchServer {
     this._lastAutoPulledTaskId = null;
     this._lastAutoPullTime = 0;
     this._lastApprovalSnapshot = null;
+    // Set when a Gemini permission prompt is escalated (not auto-approved) so Claude's
+    // get_delegation_status / get_inbox polls can see *why* Gemini looks stuck instead
+    // of the delegate_to_gemini call just timing out silently (see BUGS.md BUG-001).
+    this._geminiApprovalBlock = null;
   }
 
   async start() {
@@ -181,12 +185,31 @@ export class WorkbenchServer {
 
   _handleGeminiApprovalPrompt(snapshot) {
     try {
-      const result = evaluateGeminiApprovalPrompt(snapshot);
-      if (!result.isPrompt) return;
+      const claimedClaudeDelegatedTasks = this.intercomService
+        ? this.intercomService.getAllDelegations().filter(
+            (t) => t.toAgent === 'gemini' && t.fromAgent === 'claude' &&
+                   (t.state === 'CLAIMED' || t.state === 'RUNNING')
+          )
+        : [];
+
+      const result = evaluateGeminiApprovalPrompt(snapshot, { claimedClaudeDelegatedTasks });
+
+      if (!result.isPrompt) {
+        // Gemini's output has moved past any recognized prompt -- if we had it marked
+        // as blocked, the human must have answered it directly in the terminal.
+        if (this._geminiApprovalBlock) {
+          logger.info('GEMINI_APPROVAL:RESOLVED', 'Gemini approval prompt no longer present; clearing block', {
+            correlationId: this._geminiApprovalBlock.correlationId
+          });
+          this._geminiApprovalBlock = null;
+        }
+        return;
+      }
 
       if (result.decision === 'AUTO_APPROVE') {
         if (this._lastApprovalSnapshot === snapshot) return; // cheap guard against re-firing on an unchanged buffer
         this._lastApprovalSnapshot = snapshot;
+        this._geminiApprovalBlock = null;
         this.terminalManager.write('gemini', '1\r');
         logger.info('GEMINI_APPROVAL:AUTO_APPROVED', `Auto-approved Gemini permission prompt (category: ${result.reason})`, {
           command: result.command,
@@ -199,10 +222,36 @@ export class WorkbenchServer {
           timestamp: Date.now()
         });
       } else {
+        // Escalated: the human decides, never Claude. Record it against whichever task
+        // is currently claimed/running so Claude's status polls can see it and wait for
+        // the user, instead of the delegate_to_gemini call just timing out silently.
+        const activeTask = claimedClaudeDelegatedTasks[0] || null;
+        const alreadyBlockedOnSame = this._geminiApprovalBlock &&
+          this._geminiApprovalBlock.command === result.command &&
+          this._geminiApprovalBlock.reason === result.reason;
+
+        this._geminiApprovalBlock = {
+          correlationId: activeTask ? activeTask.correlationId : null,
+          command: result.command || null,
+          reason: result.reason,
+          since: alreadyBlockedOnSame ? this._geminiApprovalBlock.since : Date.now()
+        };
+
         logger.info('GEMINI_APPROVAL:ESCALATED', `Left Gemini permission prompt for human review (${result.reason})`, {
           command: result.command || null,
-          reason: result.reason
+          reason: result.reason,
+          correlationId: this._geminiApprovalBlock.correlationId
         });
+
+        if (!alreadyBlockedOnSame) {
+          this.broadcastEvent('gemini_approval', {
+            decision: 'ESCALATED',
+            command: result.command || null,
+            reason: result.reason,
+            correlationId: this._geminiApprovalBlock.correlationId,
+            timestamp: Date.now()
+          });
+        }
       }
     } catch (err) {
       logger.warn('GEMINI_APPROVAL:HANDLER_ERROR', `Approval prompt handler error: ${err.message}`);
@@ -832,8 +881,20 @@ export class WorkbenchServer {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'Delegation not found' }));
       }
+      // Surface a pending Gemini approval prompt on its task's status, so a client
+      // polling this (e.g. get_delegation_status) can see *why* Gemini looks stuck
+      // instead of just timing out -- and knows the decision is the human's, not
+      // Claude's, to make.
+      const responseBody = { ...task };
+      if (this._geminiApprovalBlock && this._geminiApprovalBlock.correlationId === task.correlationId) {
+        responseBody.geminiApprovalBlock = {
+          ...this._geminiApprovalBlock,
+          waitingSeconds: Math.round((Date.now() - this._geminiApprovalBlock.since) / 1000),
+          note: 'Gemini is holding on its own permission prompt for this command/file. This requires the human to approve or reject it directly in the Gemini terminal -- do not assume approval and do not proceed as if it were granted.'
+        };
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify(task));
+      return res.end(JSON.stringify(responseBody));
     }
 
     const waitMatch = pathname.match(/^\/api\/intercom\/tasks\/([a-zA-Z0-9_-]+)\/wait$/);
