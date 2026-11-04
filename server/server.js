@@ -15,6 +15,7 @@ import { IntercomService, TaskSecurityError } from './intercom_service.js';
 import { WorkspaceAuthorizationService } from './workspace_authorization.js';
 import { logger } from './logger.js';
 import { evaluate as evaluateGeminiApprovalPrompt } from './gemini_approval_policy.js';
+import { TranscriptMirror } from './transcript_mirror.js';
 import { fileURLToPath as __toPath } from 'url';
 const __serverDir = path.dirname(__toPath(import.meta.url));
 
@@ -81,9 +82,15 @@ export class WorkbenchServer {
 
     this.cliSessionRegistry = new CliSessionRegistry({ cwd });
     this.sessionPairings = new SessionPairings({ cwd });
+    this.transcriptMirror = new TranscriptMirror({ cwd });
     this.terminalManager = new TerminalManager({ cwd });
-    this.terminalManager.onGlobalExit(() => {
+    this.terminalManager.onGlobalExit((id) => {
       this._recordSessionPairing();
+      const status = this.terminalManager.getStatus(id);
+      if (status?.cliSessionId) {
+        if (id === 'claude') this.transcriptMirror.mirrorClaude(status.cliSessionId, this.currentProjectCwd);
+        if (id === 'gemini') this.transcriptMirror.mirrorGemini(status.cliSessionId, this.currentProjectCwd);
+      }
     });
     this.coordinatorService = null;
     this.workspaceAuth = new WorkspaceAuthorizationService({ baseCwd: cwd });
@@ -145,6 +152,20 @@ export class WorkbenchServer {
         // gemini_approval_policy.js for the rules. Never acts on anything flagged as
         // carrying untrusted input; those are always left for the human.
         this.terminalManager.onQuietOutput('gemini', (snapshot) => this._handleGeminiApprovalPrompt(snapshot));
+
+        // Mirroring on quiet output for cross-device synchronization
+        this.terminalManager.onQuietOutput('claude', () => {
+          const status = this.terminalManager.getStatus('claude');
+          if (status?.cliSessionId) {
+            this.transcriptMirror.mirrorClaude(status.cliSessionId, this.currentProjectCwd);
+          }
+        });
+        this.terminalManager.onQuietOutput('gemini', () => {
+          const status = this.terminalManager.getStatus('gemini');
+          if (status?.cliSessionId) {
+            this.transcriptMirror.mirrorGemini(status.cliSessionId, this.currentProjectCwd);
+          }
+        });
 
         resolve({
           port: this.allocatedPort,
@@ -774,9 +795,19 @@ export class WorkbenchServer {
         // Resume whichever side(s) this session actually has -- one click restores the
         // whole work session, not just the terminal the user happened to click from.
         if (claudeSessionId) {
+          const resClaude = this.transcriptMirror.restoreClaude(claudeSessionId, this.currentProjectCwd);
+          if (!resClaude.exists) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: `Claude session ${claudeSessionId} transcript not found locally or in mirrored sessions` }));
+          }
           await this.terminalManager.restartTerminal('claude', { resumeSessionId: claudeSessionId });
         }
         if (geminiSessionId) {
+          const resGemini = this.transcriptMirror.restoreGemini(geminiSessionId, this.currentProjectCwd);
+          if (!resGemini.exists) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: `Gemini session ${geminiSessionId} chat not found locally or in mirrored sessions` }));
+          }
           await this.terminalManager.restartTerminal('gemini', { resumeSessionId: geminiSessionId });
         }
         this._recordSessionPairing();

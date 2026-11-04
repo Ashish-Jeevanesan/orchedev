@@ -17,7 +17,7 @@ import { logger } from './logger.js';
 // Claude Code derives its per-project transcript folder name by replacing every
 // `:`, `\`, `/` and space in the absolute cwd with `-` (confirmed against this very
 // workbench's own project folder on disk).
-function claudeProjectDirName(cwd) {
+export function claudeProjectDirName(cwd) {
   return cwd.replace(/[:\\/ ]/g, '-');
 }
 
@@ -72,29 +72,42 @@ export class CliSessionRegistry {
 
   _listClaude() {
     try {
-      const dirPath = path.join(os.homedir(), '.claude', 'projects', claudeProjectDirName(this.cwd));
-      if (!fs.existsSync(dirPath)) return [];
+      const sessionsMap = new Map();
 
-      return fs.readdirSync(dirPath)
-        .filter((f) => f.endsWith('.jsonl'))
-        .map((f) => {
+      const scanDir = (dirPath) => {
+        if (!fs.existsSync(dirPath)) return;
+        const files = fs.readdirSync(dirPath).filter((f) => f.endsWith('.jsonl'));
+        for (const f of files) {
           const fullPath = path.join(dirPath, f);
           let stat;
           try {
             stat = fs.statSync(fullPath);
           } catch (e) {
-            return null;
+            continue;
           }
           const id = f.replace(/\.jsonl$/, '');
           const title = extractClaudeTitle(fullPath) || `Claude session — ${stat.mtime.toLocaleString()}`;
-          return {
-            id,
-            agent: 'claude',
-            title,
-            lastActiveAt: stat.mtime.toISOString()
-          };
-        })
-        .filter(Boolean);
+          const existing = sessionsMap.get(id);
+          if (!existing || new Date(stat.mtime).getTime() > new Date(existing.lastActiveAt).getTime()) {
+            sessionsMap.set(id, {
+              id,
+              agent: 'claude',
+              title,
+              lastActiveAt: stat.mtime.toISOString()
+            });
+          }
+        }
+      };
+
+      // 1. Scan local home directory
+      const localDirPath = path.join(os.homedir(), '.claude', 'projects', claudeProjectDirName(this.cwd));
+      scanDir(localDirPath);
+
+      // 2. Scan mirrored sessions directory
+      const mirrorDirPath = path.join(this.cwd, '.workbench_cli_sessions', 'claude');
+      scanDir(mirrorDirPath);
+
+      return Array.from(sessionsMap.values());
     } catch (e) {
       logger.warn('CLI_SESSIONS:CLAUDE_LIST_FAILED', `Failed to list Claude sessions: ${e.message}`);
       return [];
@@ -103,83 +116,48 @@ export class CliSessionRegistry {
 
   _listGeminiFromDisk() {
     try {
-      const geminiTmp = path.join(os.homedir(), '.gemini', 'tmp');
-      if (!fs.existsSync(geminiTmp)) return null;
+      const sessionsMap = new Map();
 
-      const normCwd = path.resolve(this.cwd).toLowerCase();
-      const sessions = [];
+      const parseGeminiChat = (fullPath, fileStat) => {
+        let sessionId = null;
+        let title = null;
 
-      const dirs = fs.readdirSync(geminiTmp);
-      for (const dir of dirs) {
-        const fullDir = path.join(geminiTmp, dir);
         try {
-          if (!fs.statSync(fullDir).isDirectory()) continue;
-        } catch (e) {
-          continue;
-        }
-
-        const rootFile = path.join(fullDir, '.project_root');
-        if (!fs.existsSync(rootFile)) continue;
-
-        let rootPath = '';
-        try {
-          rootPath = path.resolve(fs.readFileSync(rootFile, 'utf8').trim()).toLowerCase();
-        } catch (e) {
-          continue;
-        }
-
-        if (rootPath !== normCwd) continue;
-
-        const chatsDir = path.join(fullDir, 'chats');
-        if (!fs.existsSync(chatsDir)) continue;
-
-        const files = fs.readdirSync(chatsDir).filter((f) => f.endsWith('.jsonl'));
-        for (const f of files) {
-          const fullPath = path.join(chatsDir, f);
-          let fileStat;
-          try {
-            fileStat = fs.statSync(fullPath);
-          } catch (e) {
-            continue;
+          const content = fs.readFileSync(fullPath, 'utf8');
+          const lines = content.split('\n').filter(Boolean);
+          if (lines.length > 0) {
+            try {
+              const first = JSON.parse(lines[0]);
+              sessionId = first.sessionId || null;
+            } catch (e) {}
           }
-
-          let sessionId = null;
-          let title = null;
-
-          try {
-            const content = fs.readFileSync(fullPath, 'utf8');
-            const lines = content.split('\n').filter(Boolean);
-            if (lines.length > 0) {
-              try {
-                const first = JSON.parse(lines[0]);
-                sessionId = first.sessionId || null;
-              } catch (e) {}
+          for (const line of lines) {
+            let obj;
+            try {
+              obj = JSON.parse(line);
+            } catch (e) {
+              continue;
             }
-            for (const line of lines) {
-              let obj;
-              try {
-                obj = JSON.parse(line);
-              } catch (e) {
-                continue;
-              }
-              if (obj?.$set?.summary) {
-                title = obj.$set.summary;
-                break;
-              }
-              if (!title && obj?.type === 'user' && Array.isArray(obj.content)) {
-                for (const part of obj.content) {
-                  const txt = part?.text;
-                  if (txt && typeof txt === 'string' && !txt.trim().startsWith('<')) {
-                    title = txt.trim().slice(0, 120);
-                    break;
-                  }
+            if (obj?.$set?.summary) {
+              title = obj.$set.summary;
+              break;
+            }
+            if (!title && obj?.type === 'user' && Array.isArray(obj.content)) {
+              for (const part of obj.content) {
+                const txt = part?.text;
+                if (txt && typeof txt === 'string' && !txt.trim().startsWith('<')) {
+                  title = txt.trim().slice(0, 120);
+                  break;
                 }
               }
             }
-          } catch (e) {}
+          }
+        } catch (e) {}
 
-          if (sessionId) {
-            sessions.push({
+        if (sessionId) {
+          const existing = sessionsMap.get(sessionId);
+          if (!existing || new Date(fileStat.mtime).getTime() > new Date(existing.lastActiveAt).getTime()) {
+            sessionsMap.set(sessionId, {
               id: sessionId,
               agent: 'gemini',
               title: title || `Gemini session — ${fileStat.mtime.toLocaleString()}`,
@@ -187,9 +165,57 @@ export class CliSessionRegistry {
             });
           }
         }
+      };
+
+      // 1. Scan local ~/.gemini/tmp directories matching this project's CWD
+      const geminiTmp = path.join(os.homedir(), '.gemini', 'tmp');
+      if (fs.existsSync(geminiTmp)) {
+        const normCwd = path.resolve(this.cwd).toLowerCase();
+        const dirs = fs.readdirSync(geminiTmp);
+        for (const dir of dirs) {
+          const fullDir = path.join(geminiTmp, dir);
+          try {
+            if (!fs.statSync(fullDir).isDirectory()) continue;
+          } catch (e) { continue; }
+
+          const rootFile = path.join(fullDir, '.project_root');
+          if (!fs.existsSync(rootFile)) continue;
+
+          let rootPath = '';
+          try {
+            rootPath = path.resolve(fs.readFileSync(rootFile, 'utf8').trim()).toLowerCase();
+          } catch (e) { continue; }
+
+          if (rootPath !== normCwd) continue;
+
+          const chatsDir = path.join(fullDir, 'chats');
+          if (!fs.existsSync(chatsDir)) continue;
+
+          const files = fs.readdirSync(chatsDir).filter((f) => f.endsWith('.jsonl'));
+          for (const f of files) {
+            const fullPath = path.join(chatsDir, f);
+            try {
+              const fileStat = fs.statSync(fullPath);
+              parseGeminiChat(fullPath, fileStat);
+            } catch (e) {}
+          }
+        }
       }
 
-      return sessions;
+      // 2. Scan mirrored sessions directory
+      const mirrorGeminiDir = path.join(this.cwd, '.workbench_cli_sessions', 'gemini');
+      if (fs.existsSync(mirrorGeminiDir)) {
+        const files = fs.readdirSync(mirrorGeminiDir).filter((f) => f.endsWith('.jsonl'));
+        for (const f of files) {
+          const fullPath = path.join(mirrorGeminiDir, f);
+          try {
+            const fileStat = fs.statSync(fullPath);
+            parseGeminiChat(fullPath, fileStat);
+          } catch (e) {}
+        }
+      }
+
+      return Array.from(sessionsMap.values());
     } catch (e) {
       logger.warn('CLI_SESSIONS:GEMINI_DISK_READ_FAILED', `Failed reading Gemini sessions from disk: ${e.message}`);
       return null;

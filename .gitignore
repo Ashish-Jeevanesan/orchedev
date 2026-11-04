@@ -3,6 +3,7 @@ node_modules/
 
 # Runtime & session state
 .workbench/
+.workbench_cli_sessions/
 .workbench_tasks.json
 .workbench_tasks.json.corrupt_*
 .workbench_workspaces.json
