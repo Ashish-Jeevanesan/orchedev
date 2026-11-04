@@ -39,7 +39,7 @@
       </div>
       <div class="workspace-bar">
         <span class="ws-label" id="ws-label-folder" title="Active Project Workspace">Working Folder:</span>
-        <span class="ws-path" id="ws-path-display" title="Click to manually enter path">D:\Ashish_P\AI-Tools\custom-OCT</span>
+        <span class="ws-path" id="ws-path-display" title="Click to manually enter path">Loading workspace...</span>
         <button class="btn btn-xs btn-outline" id="btn-copy-ws-path" title="Copy current workspace path to clipboard">Copy</button>
         <select id="ws-quick-switch" class="select-input select-xs" title="Switch between authorized workspace roots" style="display:none;"></select>
         <button class="btn btn-xs btn-outline" id="btn-browse-folder" title="Browse for project folder via Windows native dialog">Browse...</button>
@@ -57,12 +57,13 @@
   <!-- Main Body Layout: Left Sidebar (Composer & Task List), Center (Terminal), Right (Task Detail) -->
   <main class="workbench-layout">
     <!-- Left Sidebar: Task Prompt Composer & Task Navigation -->
-    <aside class="pane sidebar-pane">
+    <aside class="pane sidebar-pane" id="pane-sidebar">
       <div class="pane-header">
         <div class="pane-title">
           <span class="pane-icon" id="icon-sidebar-title"></span>
-          <span>Task Composer</span>
+          <span class="pane-title-text">Task Composer</span>
         </div>
+        <button class="btn-pane-toggle" id="btn-toggle-sidebar" title="Hide Task Composer panel" data-pane="sidebar">&laquo;</button>
       </div>
 
       <!-- Task Composer Section -->
@@ -106,8 +107,11 @@
       </div>
     </aside>
 
+    <!-- Resize handle: Sidebar <-> Terminal -->
+    <div class="pane-resize-handle" id="resize-handle-left" data-handle="left" title="Drag to resize"></div>
+
     <!-- Center Pane: Interactive ConPTY Terminal Workspace -->
-    <section class="pane terminal-pane">
+    <section class="pane terminal-pane" id="pane-terminal">
       <div class="pane-header">
         <div class="terminal-tabs">
           <button class="tab-btn active" data-term="claude" id="tab-claude" title="Switch to Claude Code interactive session">
@@ -126,7 +130,12 @@
           <button class="btn btn-xs btn-secondary" id="btn-term-restart" title="Restart terminal process">Restart</button>
           <button class="btn btn-xs btn-danger" id="btn-term-stop" title="Terminate terminal process tree">Terminate</button>
           <button class="btn btn-xs btn-outline" id="btn-term-clear" title="Clear xterm visible display buffer (does not write to PTY stdin)">Clear Buffer</button>
+          <button class="btn-pane-toggle" id="btn-toggle-terminal" title="Hide Terminal panel" data-pane="terminal">&minus;</button>
         </div>
+      </div>
+      <div class="pane-collapsed-label" id="collapsed-label-terminal">
+        <span class="pane-icon" id="icon-collapsed-terminal"></span>
+        <span class="pane-title-text">Terminal</span>
       </div>
       <div class="terminal-meta-bar">
         <span class="meta-item"><span class="meta-label">Mode:</span> ConPTY Interactive</span>
@@ -142,14 +151,18 @@
       </div>
     </section>
 
+    <!-- Resize handle: Terminal <-> Task Detail -->
+    <div class="pane-resize-handle" id="resize-handle-right" data-handle="right" title="Drag to resize"></div>
+
     <!-- Right Pane: Task Detail Inspector -->
-    <section class="pane task-detail-pane">
+    <section class="pane task-detail-pane" id="pane-detail">
       <div class="pane-header">
         <div class="pane-title">
           <span class="pane-icon" id="icon-inspector-title"></span>
-          <span>Task Detail Inspector</span>
+          <span class="pane-title-text">Task Detail Inspector</span>
           <span class="badge badge-sm badge-secondary">Real-Time</span>
         </div>
+        <button class="btn-pane-toggle" id="btn-toggle-detail" title="Hide Task Detail panel" data-pane="detail">&raquo;</button>
       </div>
       <div class="task-detail-panel" id="task-detail-container">
         <div class="empty-state">Select a task on the left to inspect parameters, execution timeline, and output.</div>

@@ -6,8 +6,11 @@ import { spawn, execSync } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { fileURLToPath } from 'url';
 
-const CWD = 'D:\\Ashish_P\\AI-Tools\\custom-OCT';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const CWD = process.env.WORKBENCH_CWD || path.resolve(__dirname, '..');
 const SESSION_FILE = path.join(CWD, '.workbench_session.json');
 const USER_DATA_DIR = path.join(os.tmpdir(), 'workbench_edge_profile');
 

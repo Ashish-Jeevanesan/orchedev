@@ -189,11 +189,114 @@ body {
 .workbench-layout {
   flex: 1;
   display: grid;
-  grid-template-columns: 340px minmax(460px, 1.25fr) minmax(360px, 1fr);
+  grid-template-columns: var(--w-sidebar, 340px) 6px minmax(360px, 1fr) 6px var(--w-detail, 360px);
   height: calc(100vh - 48px - 32px);
   overflow: hidden;
   background: var(--bg-main);
   gap: 1px;
+}
+
+/* Resize handles between panes (desktop layout only) */
+.pane-resize-handle {
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.pane-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 2px;
+  background: var(--border-color);
+  transition: background 0.15s ease;
+}
+
+.pane-resize-handle:hover::after,
+.pane-resize-handle.dragging::after {
+  background: var(--color-primary);
+}
+
+/* Collapsed side panes: shrink to a slim strip, hide inner content */
+.workbench-layout.sidebar-collapsed .sidebar-pane .task-composer,
+.workbench-layout.sidebar-collapsed .sidebar-pane .task-list-panel,
+.workbench-layout.detail-collapsed .task-detail-pane .task-detail-panel {
+  display: none;
+}
+
+.workbench-layout.sidebar-collapsed #resize-handle-left,
+.workbench-layout.detail-collapsed #resize-handle-right {
+  cursor: default;
+  pointer-events: none;
+}
+
+.pane.pane-is-collapsed .pane-header {
+  justify-content: center;
+  padding: 0 6px;
+}
+
+.pane.pane-is-collapsed .pane-title span:not(.pane-icon),
+.pane.pane-is-collapsed .pane-title .badge {
+  display: none;
+}
+
+.btn-pane-toggle {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-muted);
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.btn-pane-toggle:hover {
+  background: var(--bg-elevated);
+  color: var(--text-main);
+}
+
+/* Collapsed terminal pane: show a slim vertical label instead of tabs/body */
+.pane-collapsed-label {
+  display: none;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.pane-collapsed-label .pane-title-text {
+  writing-mode: vertical-rl;
+  letter-spacing: 0.5px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.terminal-pane.pane-is-collapsed .pane-header,
+.terminal-pane.pane-is-collapsed .terminal-meta-bar,
+.terminal-pane.pane-is-collapsed .terminal-body {
+  display: none;
+}
+
+.terminal-pane.pane-is-collapsed .pane-collapsed-label {
+  display: flex;
+}
+
+@media (max-width: 1100px) {
+  .pane-resize-handle {
+    display: none;
+  }
 }
 
 .pane {

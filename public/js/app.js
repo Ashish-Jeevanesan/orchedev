@@ -7,6 +7,7 @@ import { TaskViewController } from './task_view.js';
 import { ActivityViewController } from './activity_view.js';
 import { dialogService } from './dialog_service.js';
 import { getIcon, initIcons } from './icons.js';
+import { PaneLayoutController } from './pane_layout.js';
 
 function extractAndClearToken() {
   const hash = window.location.hash;
@@ -65,6 +66,8 @@ class WorkbenchApp {
     initIcons();
 
     this.activityView = new ActivityViewController();
+    this.paneLayout = new PaneLayoutController();
+    this.paneLayout.init();
 
     this.taskView = new TaskViewController({
       token: this.token,
