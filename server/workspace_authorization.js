@@ -4,11 +4,13 @@
 
 import fs from 'fs';
 import path from 'path';
+import { getDeviceIdentity } from './device_identity.js';
 import { TaskSecurityError } from './intercom_service.js';
 
 export class WorkspaceAuthorizationService {
   constructor({ baseCwd = process.cwd(), allowedRoots = [], persistRoots = true } = {}) {
     this.baseCwd = path.resolve(baseCwd);
+    this.deviceId = getDeviceIdentity().id;
     this.allowedRoots = new Set();
     this.persistRoots = persistRoots;
     this.storageFile = path.join(this.baseCwd, '.workbench_workspaces.json');
@@ -35,16 +37,24 @@ export class WorkspaceAuthorizationService {
       const raw = fs.readFileSync(this.storageFile, 'utf8');
       if (!raw || !raw.trim()) return;
       const parsed = JSON.parse(raw);
-      const roots = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.roots) ? parsed.roots : []);
-      let prunedAny = false;
-      for (const r of roots) {
-        if (!this.addAllowedRoot(r, false)) {
-          // If a previously stored root is no longer valid or no longer exists, it was pruned
-          prunedAny = true;
+
+      let roots = [];
+      if (Array.isArray(parsed)) {
+        roots = parsed;
+      } else if (parsed && typeof parsed === 'object') {
+        if (Array.isArray(parsed.roots)) {
+          roots = parsed.roots;
+        } else {
+          for (const val of Object.values(parsed)) {
+            if (Array.isArray(val)) {
+              roots.push(...val);
+            }
+          }
         }
       }
-      if (prunedAny) {
-        this._savePersistedRoots();
+
+      for (const r of roots) {
+        this.addAllowedRoot(r, false);
       }
     } catch (e) {
       // Storage read error isolated; preserve baseCwd in memory
@@ -54,17 +64,29 @@ export class WorkspaceAuthorizationService {
   _savePersistedRoots() {
     if (!this.persistRoots) return;
     try {
-      const payload = {
-        version: 1,
-        lastUpdated: Date.now(),
-        roots: Array.from(this.allowedRoots)
-      };
+      let store = {};
+      if (fs.existsSync(this.storageFile)) {
+        try {
+          const raw = fs.readFileSync(this.storageFile, 'utf8');
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            if (parsed.roots && Array.isArray(parsed.roots)) {
+              store['legacy'] = parsed.roots;
+            } else {
+              store = parsed;
+            }
+          }
+        } catch (e) {}
+      }
+
+      store[this.deviceId] = Array.from(this.allowedRoots);
+
       const tmp = `${this.storageFile}.tmp_${Date.now()}`;
-      fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8');
+      fs.writeFileSync(tmp, JSON.stringify(store, null, 2), 'utf8');
       try {
         fs.renameSync(tmp, this.storageFile);
       } catch (err) {
-        fs.writeFileSync(this.storageFile, JSON.stringify(payload, null, 2), 'utf8');
+        fs.writeFileSync(this.storageFile, JSON.stringify(store, null, 2), 'utf8');
         try { fs.unlinkSync(tmp); } catch (_) {}
       }
     } catch (e) {

@@ -8,7 +8,7 @@ node_modules/
 .workbench_tasks.json.corrupt_*
 .workbench_workspaces.json
 .workbench_session.json
-.workbench_session_pairings.json
+.workbench_session_pairings*.json
 .gemini/
 
 # Logs
