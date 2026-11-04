@@ -5,6 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
+import { execSync } from 'child_process';
 import pty from '@homebridge/node-pty-prebuilt-multiarch';
 import { ProcessManager } from '../core/process_manager.js';
 import { logger } from './logger.js';
@@ -12,8 +13,24 @@ import { fileURLToPath as __toPath } from 'url';
 const __serverDir = path.dirname(__toPath(import.meta.url));
 
 function resolveClaudeBin() {
+  let globalNpmCandidate = null;
+  try {
+    const globalRoot = execSync('npm root -g', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    if (globalRoot) {
+      globalNpmCandidate = path.join(globalRoot, '@anthropic-ai', 'claude-code', 'bin', process.platform === 'win32' ? 'claude.exe' : 'claude');
+    }
+  } catch (e) {}
+
   const candidates = [
     process.env.CLAUDE_BIN,
+    // macOS candidates
+    '/opt/homebrew/bin/claude',
+    '/usr/local/bin/claude',
+    path.join(os.homedir(), '.npm-global', 'bin', 'claude'),
+    path.join(os.homedir(), '.local', 'bin', 'claude'),
+    // Dynamic global npm lookup
+    globalNpmCandidate,
+    // Windows paths
     path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'),
     path.join(process.env.LOCALAPPDATA || '', 'Programs', 'claude', 'claude.exe'),
     path.join(process.env.USERPROFILE || '', '.local', 'bin', 'claude.exe'),
@@ -27,8 +44,20 @@ function resolveClaudeBin() {
 }
 
 function resolveGeminiBundlePath() {
+  let globalNpmCandidate = null;
+  try {
+    const globalRoot = execSync('npm root -g', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    if (globalRoot) {
+      globalNpmCandidate = path.join(globalRoot, '@google', 'gemini-cli', 'bundle', 'gemini.js');
+    }
+  } catch (e) {}
+
   const candidates = [
     process.env.GEMINI_BUNDLE_PATH,
+    globalNpmCandidate,
+    '/opt/homebrew/lib/node_modules/@google/gemini-cli/bundle/gemini.js',
+    '/usr/local/lib/node_modules/@google/gemini-cli/bundle/gemini.js',
+    path.join(os.homedir(), '.npm-global', 'lib', 'node_modules', '@google', 'gemini-cli', 'bundle', 'gemini.js'),
     path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@google', 'gemini-cli', 'bundle', 'gemini.js'),
     'C:\\Users\\ajeevanesan\\AppData\\Local\\nvm\\v22.23.1\\node_modules\\@google\\gemini-cli\\bundle\\gemini.js'
   ].filter(Boolean);
@@ -230,7 +259,7 @@ export class TerminalManager {
       }
 
       return {
-        file: bundlePath ? process.execPath : 'gemini.cmd',
+        file: bundlePath ? process.execPath : (process.platform === 'win32' ? 'gemini.cmd' : 'gemini'),
         args,
         name: 'gemini-interactive'
       };

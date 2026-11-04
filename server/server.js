@@ -18,29 +18,54 @@ import { evaluate as evaluateGeminiApprovalPrompt } from './gemini_approval_poli
 import { fileURLToPath as __toPath } from 'url';
 const __serverDir = path.dirname(__toPath(import.meta.url));
 
-function openWindowsFolderPicker() {
+function openFolderPicker() {
   return new Promise((resolve, reject) => {
-    const psCmd = `Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; $dialog.Description = 'Select Working Project Directory'; $dialog.ShowNewFolderButton = $true; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath }`;
-    const child = spawn('powershell.exe', ['-NoProfile', '-STA', '-Command', psCmd], {
-      windowsHide: false
-    });
+    if (process.platform === 'darwin') {
+      const osaCmd = 'POSIX path of (choose folder with prompt "Select Working Project Directory")';
+      const child = spawn('osascript', ['-e', osaCmd]);
 
-    let stdout = '';
-    let stderr = '';
+      let stdout = '';
+      let stderr = '';
 
-    child.stdout.on('data', d => stdout += d.toString());
-    child.stderr.on('data', d => stderr += d.toString());
+      child.stdout.on('data', d => stdout += d.toString());
+      child.stderr.on('data', d => stderr += d.toString());
 
-    child.on('close', (code) => {
-      if (code === 0) {
-        const selected = stdout.trim();
-        resolve(selected || null);
-      } else {
-        reject(new Error(stderr || `PowerShell exited with code ${code}`));
-      }
-    });
+      child.on('close', (code) => {
+        if (code === 0) {
+          const selected = stdout.trim();
+          resolve(selected || null);
+        } else if (stderr.includes('User canceled') || stderr.includes('(-128)')) {
+          // User clicked cancel in AppleScript dialog
+          resolve(null);
+        } else {
+          reject(new Error(stderr || `osascript exited with code ${code}`));
+        }
+      });
 
-    child.on('error', reject);
+      child.on('error', reject);
+    } else {
+      const psCmd = `Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; $dialog.Description = 'Select Working Project Directory'; $dialog.ShowNewFolderButton = $true; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath }`;
+      const child = spawn('powershell.exe', ['-NoProfile', '-STA', '-Command', psCmd], {
+        windowsHide: false
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout.on('data', d => stdout += d.toString());
+      child.stderr.on('data', d => stderr += d.toString());
+
+      child.on('close', (code) => {
+        if (code === 0) {
+          const selected = stdout.trim();
+          resolve(selected || null);
+        } else {
+          reject(new Error(stderr || `PowerShell exited with code ${code}`));
+        }
+      });
+
+      child.on('error', reject);
+    }
   });
 }
 
@@ -635,7 +660,7 @@ export class WorkbenchServer {
 
     if (pathname === '/api/workspace/browse' && req.method === 'POST') {
       try {
-        const selectedPath = await openWindowsFolderPicker();
+        const selectedPath = await openFolderPicker();
         if (!selectedPath) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ cancelled: true, projectCwd: this.currentProjectCwd }));
