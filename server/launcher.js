@@ -11,7 +11,7 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CWD = process.env.WORKBENCH_CWD || path.resolve(__dirname, '..');
-const SESSION_FILE = path.join(CWD, '.workbench_session.json');
+const SESSION_FILE = path.join(os.tmpdir(), 'orchedev_session.json');
 const USER_DATA_DIR = path.join(os.tmpdir(), 'workbench_edge_profile');
 
 function findBrowserBinary() {

@@ -3,6 +3,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import crypto from 'crypto';
 import pty from '@homebridge/node-pty-prebuilt-multiarch';
 import { ProcessManager } from '../core/process_manager.js';
@@ -144,17 +145,8 @@ export class TerminalManager {
         args.push('--session-id', sessionId);
       }
       if (this.workbenchPort && this.sessionToken) {
-        const mcpDir = path.join(resolvedCwd, '.workbench');
         try {
-          if (!fs.existsSync(mcpDir)) fs.mkdirSync(mcpDir, { recursive: true });
-          const mcpConfigPath = path.join(mcpDir, 'claude_mcp_config.json');
-          if (fs.existsSync(mcpConfigPath)) {
-            if (!this.preExistingConfigs.has(mcpConfigPath)) {
-              this.preExistingConfigs.set(mcpConfigPath, fs.readFileSync(mcpConfigPath, 'utf8'));
-            }
-          } else {
-            this.generatedFiles.add(mcpConfigPath);
-          }
+          const mcpConfigPath = path.join(os.tmpdir(), 'orchedev_claude_mcp_config.json');
           const mcpConfig = {
             mcpServers: {
               workbench: {
@@ -171,6 +163,7 @@ export class TerminalManager {
           };
           fs.writeFileSync(mcpConfigPath, JSON.stringify(mcpConfig, null, 2), 'utf8');
           args.push('--mcp-config', mcpConfigPath);
+          this.generatedFiles.add(mcpConfigPath);
           logger.info('TERMINAL:MCP_CONFIG_PREPARED', `Prepared Claude MCP configuration in ${mcpConfigPath}`, {
             mcpConfigPath,
             port: this.workbenchPort
@@ -194,10 +187,10 @@ export class TerminalManager {
         args.push('--session-id', sessionId);
       }
       if (this.workbenchPort && this.sessionToken) {
-        const geminiDir = path.join(resolvedCwd, '.gemini');
         try {
-          if (!fs.existsSync(geminiDir)) fs.mkdirSync(geminiDir, { recursive: true });
-          const settingsPath = path.join(geminiDir, 'settings.json');
+          const globalGeminiDir = path.join(os.homedir(), '.gemini');
+          if (!fs.existsSync(globalGeminiDir)) fs.mkdirSync(globalGeminiDir, { recursive: true });
+          const settingsPath = path.join(globalGeminiDir, 'settings.json');
           let settings = {};
           if (fs.existsSync(settingsPath)) {
             if (!this.preExistingConfigs.has(settingsPath)) {
@@ -227,7 +220,7 @@ export class TerminalManager {
           };
           fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
           args.push('--allowed-mcp-server-names', 'workbench');
-          logger.info('TERMINAL:MCP_CONFIG_PREPARED', `Prepared Gemini workspace MCP configuration in ${settingsPath}`, {
+          logger.info('TERMINAL:MCP_CONFIG_PREPARED', `Prepared Gemini user profile MCP configuration in ${settingsPath}`, {
             settingsPath,
             port: this.workbenchPort
           });
@@ -454,56 +447,44 @@ export class TerminalManager {
       return;
     }
 
-    const resolvedCwd = path.resolve(targetCwd || this.projectCwd || this.cwd);
-    const configFile = id === 'claude'
-      ? path.join(resolvedCwd, '.workbench', 'claude_mcp_config.json')
-      : path.join(resolvedCwd, '.gemini', 'settings.json');
-
-    try {
-      if (fs.existsSync(configFile)) {
-        if (id === 'gemini') {
-          try {
-            const currentSettings = JSON.parse(fs.readFileSync(configFile, 'utf8'));
-            if (currentSettings.mcpServers) {
-              delete currentSettings.mcpServers.workbench;
-              if (Object.keys(currentSettings.mcpServers).length === 0) {
-                delete currentSettings.mcpServers;
-              }
-            }
-            if (!this.preExistingConfigs.has(configFile) && Object.keys(currentSettings).length === 0) {
-              fs.unlinkSync(configFile);
-              logger.info('TERMINAL:CONFIG_UNLINKED', `Unlinked ephemeral workbench configuration: ${configFile}`);
-            } else {
-              fs.writeFileSync(configFile, JSON.stringify(currentSettings, null, 2), 'utf8');
-              logger.info('TERMINAL:CONFIG_PRUNED', `Removed workbench MCP entry while preserving user settings: ${configFile}`);
-            }
-          } catch (e) {
-            if (this.preExistingConfigs.has(configFile)) {
-              fs.writeFileSync(configFile, this.preExistingConfigs.get(configFile), 'utf8');
+    if (id === 'claude') {
+      const configFile = path.join(os.tmpdir(), 'orchedev_claude_mcp_config.json');
+      try {
+        if (fs.existsSync(configFile)) {
+          fs.unlinkSync(configFile);
+          logger.info('TERMINAL:CONFIG_UNLINKED', `Unlinked ephemeral workbench configuration: ${configFile}`);
+        }
+        this.preExistingConfigs.delete(configFile);
+        this.generatedFiles.delete(configFile);
+      } catch (e) {
+        logger.warn('TERMINAL:CONFIG_CLEANUP_WARN', `Could not clean config ${configFile}: ${e.message}`);
+      }
+    } else if (id === 'gemini') {
+      const settingsPath = path.join(os.homedir(), '.gemini', 'settings.json');
+      try {
+        if (fs.existsSync(settingsPath)) {
+          const currentSettings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+          if (currentSettings.mcpServers) {
+            delete currentSettings.mcpServers.workbench;
+            if (Object.keys(currentSettings.mcpServers).length === 0) {
+              delete currentSettings.mcpServers;
             }
           }
-        } else if (id === 'claude') {
-          if (!this.preExistingConfigs.has(configFile)) {
-            fs.unlinkSync(configFile);
-            logger.info('TERMINAL:CONFIG_UNLINKED', `Unlinked ephemeral workbench configuration: ${configFile}`);
+          if (!this.preExistingConfigs.has(settingsPath) && Object.keys(currentSettings).length === 0) {
+            fs.unlinkSync(settingsPath);
+            logger.info('TERMINAL:CONFIG_UNLINKED', `Unlinked ephemeral user settings: ${settingsPath}`);
           } else {
-            try {
-              const currentConfig = JSON.parse(fs.readFileSync(configFile, 'utf8'));
-              if (currentConfig.mcpServers) {
-                delete currentConfig.mcpServers.workbench;
-                if (Object.keys(currentConfig.mcpServers).length === 0) delete currentConfig.mcpServers;
-              }
-              fs.writeFileSync(configFile, JSON.stringify(currentConfig, null, 2), 'utf8');
-            } catch (e) {
-              fs.writeFileSync(configFile, this.preExistingConfigs.get(configFile), 'utf8');
-            }
+            fs.writeFileSync(settingsPath, JSON.stringify(currentSettings, null, 2), 'utf8');
+            logger.info('TERMINAL:CONFIG_PRUNED', `Removed workbench MCP entry from user settings: ${settingsPath}`);
           }
         }
+      } catch (e) {
+        if (this.preExistingConfigs.has(settingsPath)) {
+          try { fs.writeFileSync(settingsPath, this.preExistingConfigs.get(settingsPath), 'utf8'); } catch (err) {}
+        }
       }
-      this.preExistingConfigs.delete(configFile);
-      this.generatedFiles.delete(configFile);
-    } catch (e) {
-      logger.warn('TERMINAL:CONFIG_CLEANUP_WARN', `Could not clean config ${configFile}: ${e.message}`);
+      this.preExistingConfigs.delete(settingsPath);
+      this.generatedFiles.delete(settingsPath);
     }
   }
 
