@@ -61,6 +61,14 @@ OrcheDev is designed around explicit human control:
 
 See the project documentation for the currently supported Windows environment, Node.js version, CLI versions, and setup process.
 
+### macOS Prerequisites
+
+When installing OrcheDev on macOS, ensure that **Xcode Command Line Tools** are installed before running `npm install`:
+```bash
+xcode-select --install
+```
+This is required because the terminal PTY dependency (`@homebridge/node-pty-prebuilt-multiarch`) compiles native bindings from source on Darwin if prebuilt binaries are unavailable for the specific architecture.
+
 ## Documentation
 
 Project architecture, implementation reports, testing notes, and development documentation are maintained in the `research/` directory.

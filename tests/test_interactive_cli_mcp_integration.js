@@ -3,6 +3,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import { WorkbenchServer } from '../server/server.js';
 import { IntercomService, DelegationState } from '../server/intercom_service.js';
@@ -242,10 +243,11 @@ async function runAcceptancePass() {
 
     // Verify Claude terminal config generation
     const claudeConfig = server.terminalManager.getTerminalConfig('claude', TEMP_WORKSPACE);
-    const claudeMcpFile = path.join(TEMP_WORKSPACE, '.workbench', 'claude_mcp_config.json');
-    assert(fs.existsSync(claudeMcpFile), 'Auto-generated .workbench/claude_mcp_config.json in target workspace');
+    const claudeMcpFile = claudeConfig.args[claudeConfig.args.indexOf('--mcp-config') + 1];
+    assert(fs.existsSync(claudeMcpFile), 'Auto-generated temp Claude MCP config in os.tmpdir()');
     assert(claudeConfig.args.includes('--mcp-config'), 'Claude terminal args include --mcp-config');
     assert(claudeConfig.args.includes(claudeMcpFile), 'Claude terminal args point to generated config file');
+    assert(!fs.existsSync(path.join(TEMP_WORKSPACE, '.workbench', 'claude_mcp_config.json')), 'Workspace not polluted with claude_mcp_config.json');
 
     const claudeConfigContent = JSON.parse(fs.readFileSync(claudeMcpFile, 'utf8'));
     assert(claudeConfigContent.mcpServers.workbench !== undefined, 'Claude config specifies workbench MCP server');
@@ -254,17 +256,23 @@ async function runAcceptancePass() {
 
     // Verify Gemini terminal config generation
     const geminiConfig = server.terminalManager.getTerminalConfig('gemini', TEMP_WORKSPACE);
-    const geminiSettingsFile = path.join(TEMP_WORKSPACE, '.gemini', 'settings.json');
-    assert(fs.existsSync(geminiSettingsFile), 'Auto-generated .gemini/settings.json in target workspace');
+    const userGeminiSettings = path.join(os.homedir(), '.gemini', 'settings.json');
+    assert(fs.existsSync(userGeminiSettings), 'Auto-generated Gemini MCP in user profile ~/.gemini/settings.json');
+    assert(geminiConfig.args.includes('--allowed-mcp-server-names'), 'Gemini terminal args include --allowed-mcp-server-names');
+    assert(!fs.existsSync(path.join(TEMP_WORKSPACE, '.gemini', 'settings.json')), 'Workspace not polluted with .gemini/settings.json');
 
-    const geminiSettingsContent = JSON.parse(fs.readFileSync(geminiSettingsFile, 'utf8'));
+    const geminiSettingsContent = JSON.parse(fs.readFileSync(userGeminiSettings, 'utf8'));
     assert(geminiSettingsContent.mcpServers.workbench !== undefined, 'Gemini settings specify workbench MCP server');
     assert(geminiSettingsContent.mcpServers.workbench.args.includes('gemini'), 'Gemini MCP args specify agent gemini');
 
-    // Global settings isolation check
-    const globalSettingsPath = 'C:\\Users\\ajeevanesan\\.gemini\\settings.json';
-    const globalSettingsRaw = fs.readFileSync(globalSettingsPath, 'utf8');
-    assert(!globalSettingsRaw.includes(String(port)), 'Global ~/.gemini/settings.json is 100% untouched and unpolluted');
+    // Global settings configuration check
+    const globalSettingsPath = path.join(os.homedir(), '.gemini', 'settings.json');
+    if (fs.existsSync(globalSettingsPath)) {
+      const globalSettingsRaw = fs.readFileSync(globalSettingsPath, 'utf8');
+      assert(globalSettingsRaw.includes(String(port)), 'User profile ~/.gemini/settings.json configured with active workbench port');
+    } else {
+      assert(false, 'Expected user profile ~/.gemini/settings.json to exist');
+    }
 
     // Start ConPTY Gemini session and verify process spawning
     console.log('\n[ConPTY Live Test] Spawning actual Gemini ConPTY process in workspace...');
@@ -299,6 +307,10 @@ async function runAcceptancePass() {
           });
           server.terminalManager.terminate('gemini').catch(() => {});
         });
+      }
+      if (fs.existsSync(globalSettingsPath)) {
+        const cleanedRaw = fs.readFileSync(globalSettingsPath, 'utf8');
+        assert(!cleanedRaw.includes(String(port)), 'User profile ~/.gemini/settings.json cleanly pruned on terminal termination');
       }
       await server.shutdown();
     }

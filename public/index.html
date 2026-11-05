@@ -50,6 +50,10 @@
         <span class="status-dot"></span>
         <span class="status-text">Connected</span>
       </div>
+      <button class="btn btn-sm btn-outline" id="btn-gemini-sleep-mode" title="When ON, Gemini's own shell-execution prompts are auto-approved without waiting for you (file edits and untrusted/dangerous commands still escalate). Every approval is logged.">
+        <span class="btn-icon" id="icon-sleep-mode"></span> <span id="sleep-mode-label">Sleep Mode: OFF</span>
+      </button>
+      <button class="btn btn-sm btn-outline" id="btn-open-sessions" title="Browse and resume past Claude/Gemini CLI sessions">Sessions</button>
       <button class="btn btn-sm btn-danger" id="btn-shutdown" title="Terminate all processes and close workbench">Shutdown</button>
     </div>
   </header>
@@ -263,6 +267,31 @@
         <button class="btn btn-sm btn-success" id="btn-appr-approve">
           <span class="btn-icon" id="icon-appr-check"></span> Approve Plan
         </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: CLI Session History (Claude + Gemini) -->
+  <div class="modal-backdrop" id="modal-sessions" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="modal-sessions-title">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <div class="modal-title" id="modal-sessions-title">
+          <span>Session History</span>
+        </div>
+        <button class="btn-close" id="btn-close-sessions" title="Close (Esc)">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="sessions-filter-tabs" id="sessions-filter-tabs">
+          <button class="filter-btn active" data-agent="all" id="btn-sessions-filter-all">All</button>
+          <button class="filter-btn" data-agent="claude" id="btn-sessions-filter-claude" title="Claude sessions, including any that delegated work to Gemini">Claude</button>
+          <button class="filter-btn" data-agent="gemini" id="btn-sessions-filter-gemini" title="Gemini used standalone, with no Claude session">Gemini (standalone)</button>
+        </div>
+        <div class="sessions-list" id="sessions-list-container">
+          <div class="empty-state">No past sessions recorded yet.</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <span class="modal-hint">Resuming restarts that terminal with the CLI's own <code>--resume</code>, bringing its full conversation history back.</span>
       </div>
     </div>
   </div>

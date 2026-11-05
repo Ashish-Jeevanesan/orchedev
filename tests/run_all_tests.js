@@ -5,7 +5,7 @@ import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 
-const CWD = 'D:\\Ashish_P\\AI-Tools\\custom-OCT';
+const CWD = process.cwd();
 
 const testFiles = [
   'test_01_sequential.js',

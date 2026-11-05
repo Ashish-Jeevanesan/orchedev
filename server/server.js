@@ -8,36 +8,65 @@ import crypto from 'crypto';
 import { spawn } from 'child_process';
 import { WebSocketServer, WebSocket } from 'ws';
 import { TerminalManager } from './terminal_manager.js';
+import { CliSessionRegistry } from './cli_session_registry.js';
+import { SessionPairings } from './session_pairings.js';
 import { TaskCoordinatorService } from './task_coordinator_service.js';
 import { IntercomService, TaskSecurityError } from './intercom_service.js';
 import { WorkspaceAuthorizationService } from './workspace_authorization.js';
 import { logger } from './logger.js';
+import { evaluate as evaluateGeminiApprovalPrompt } from './gemini_approval_policy.js';
+import { TranscriptMirror } from './transcript_mirror.js';
 import { fileURLToPath as __toPath } from 'url';
 const __serverDir = path.dirname(__toPath(import.meta.url));
 
-function openWindowsFolderPicker() {
+function openFolderPicker() {
   return new Promise((resolve, reject) => {
-    const psCmd = `Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; $dialog.Description = 'Select Working Project Directory'; $dialog.ShowNewFolderButton = $true; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath }`;
-    const child = spawn('powershell.exe', ['-NoProfile', '-STA', '-Command', psCmd], {
-      windowsHide: false
-    });
+    if (process.platform === 'darwin') {
+      const osaCmd = 'POSIX path of (choose folder with prompt "Select Working Project Directory")';
+      const child = spawn('osascript', ['-e', osaCmd]);
 
-    let stdout = '';
-    let stderr = '';
+      let stdout = '';
+      let stderr = '';
 
-    child.stdout.on('data', d => stdout += d.toString());
-    child.stderr.on('data', d => stderr += d.toString());
+      child.stdout.on('data', d => stdout += d.toString());
+      child.stderr.on('data', d => stderr += d.toString());
 
-    child.on('close', (code) => {
-      if (code === 0) {
-        const selected = stdout.trim();
-        resolve(selected || null);
-      } else {
-        reject(new Error(stderr || `PowerShell exited with code ${code}`));
-      }
-    });
+      child.on('close', (code) => {
+        if (code === 0) {
+          const selected = stdout.trim();
+          resolve(selected || null);
+        } else if (stderr.includes('User canceled') || stderr.includes('(-128)')) {
+          // User clicked cancel in AppleScript dialog
+          resolve(null);
+        } else {
+          reject(new Error(stderr || `osascript exited with code ${code}`));
+        }
+      });
 
-    child.on('error', reject);
+      child.on('error', reject);
+    } else {
+      const psCmd = `Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; $dialog.Description = 'Select Working Project Directory'; $dialog.ShowNewFolderButton = $true; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath }`;
+      const child = spawn('powershell.exe', ['-NoProfile', '-STA', '-Command', psCmd], {
+        windowsHide: false
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout.on('data', d => stdout += d.toString());
+      child.stderr.on('data', d => stderr += d.toString());
+
+      child.on('close', (code) => {
+        if (code === 0) {
+          const selected = stdout.trim();
+          resolve(selected || null);
+        } else {
+          reject(new Error(stderr || `PowerShell exited with code ${code}`));
+        }
+      });
+
+      child.on('error', reject);
+    }
   });
 }
 
@@ -51,7 +80,18 @@ export class WorkbenchServer {
     this.sessionToken = crypto.randomBytes(24).toString('hex');
     this.publicDir = path.join(__serverDir, '..', 'public');
 
+    this.cliSessionRegistry = new CliSessionRegistry({ cwd });
+    this.sessionPairings = new SessionPairings({ cwd });
+    this.transcriptMirror = new TranscriptMirror({ cwd });
     this.terminalManager = new TerminalManager({ cwd });
+    this.terminalManager.onGlobalExit((id) => {
+      this._recordSessionPairing();
+      const status = this.terminalManager.getStatus(id);
+      if (status?.cliSessionId) {
+        if (id === 'claude') this.transcriptMirror.mirrorClaude(status.cliSessionId, this.currentProjectCwd);
+        if (id === 'gemini') this.transcriptMirror.mirrorGemini(status.cliSessionId, this.currentProjectCwd);
+      }
+    });
     this.coordinatorService = null;
     this.workspaceAuth = new WorkspaceAuthorizationService({ baseCwd: cwd });
     this.intercomService = null;
@@ -59,8 +99,21 @@ export class WorkbenchServer {
     this.eventSockets = new Set();
     this.allocatedPort = null;
     this._autoPullInterval = null;
+    this._geminiMcpHealthInterval = null;
     this._lastAutoPulledTaskId = null;
     this._lastAutoPullTime = 0;
+    this._lastApprovalSnapshot = null;
+    // Set when a Gemini permission prompt is escalated (not auto-approved) so Claude's
+    // get_delegation_status / get_inbox polls can see *why* Gemini looks stuck instead
+    // of the delegate_to_gemini call just timing out silently (see BUGS.md BUG-001).
+    this._geminiApprovalBlock = null;
+    // "Sleep Mode": a human-operated toggle (header button, /api/gemini/sleep-mode) that
+    // widens Gemini's shell-prompt auto-approval beyond gemini_approval_policy.js's
+    // SAFE_CATEGORIES allowlist -- for unattended stretches (e.g. overnight) where no one
+    // is at the terminal to answer prompts. The untrusted-input-marker and
+    // DANGEROUS_PATTERNS vetoes in that policy are never affected by this flag. Off by
+    // default on every process start; never persisted across restarts.
+    this._geminiSleepMode = false;
   }
 
   async start() {
@@ -97,10 +150,44 @@ export class WorkbenchServer {
         this.terminalManager.getTerminalConfig('gemini');
         console.log(`[WorkbenchServer] Listening strictly on 127.0.0.1:${this.allocatedPort}`);
 
-        // Recurring 15-second auto-pull check for Gemini worker terminal
+        // Recurring 15-second auto-pull check for Gemini worker terminal (fallback poll;
+        // task_state_changed already triggers this immediately -- see broadcastEvent())
         this._autoPullInterval = setInterval(() => {
           this._checkAndTriggerAutoPull();
         }, 15000);
+
+        // Recurring self-heal check: Gemini CLI's own settings-persistence occasionally
+        // rewrites the whole ~/.gemini/settings.json file from its own in-memory state,
+        // silently dropping our hand-injected 'mcpServers.workbench' entry even while the
+        // terminal keeps running -- see the comment on
+        // TerminalManager.ensureGeminiMcpSettingsAlive() for how this was confirmed. This
+        // re-injects it if it ever goes missing, so the human never has to notice an
+        // MCP:OFFLINE badge and manually restart the terminal to recover.
+        this._geminiMcpHealthInterval = setInterval(() => {
+          const repaired = this.terminalManager.ensureGeminiMcpSettingsAlive();
+          if (repaired) {
+            this.broadcastEvent('gemini_mcp_self_healed', { timestamp: Date.now() });
+          }
+        }, 20000);
+
+        // Scoped, logged auto-approval for Gemini's own permission prompts -- see
+        // gemini_approval_policy.js for the rules. Never acts on anything flagged as
+        // carrying untrusted input; those are always left for the human.
+        this.terminalManager.onQuietOutput('gemini', (snapshot) => this._handleGeminiApprovalPrompt(snapshot));
+
+        // Mirroring on quiet output for cross-device synchronization
+        this.terminalManager.onQuietOutput('claude', () => {
+          const status = this.terminalManager.getStatus('claude');
+          if (status?.cliSessionId) {
+            this.transcriptMirror.mirrorClaude(status.cliSessionId, this.currentProjectCwd);
+          }
+        });
+        this.terminalManager.onQuietOutput('gemini', () => {
+          const status = this.terminalManager.getStatus('gemini');
+          if (status?.cliSessionId) {
+            this.transcriptMirror.mirrorGemini(status.cliSessionId, this.currentProjectCwd);
+          }
+        });
 
         resolve({
           port: this.allocatedPort,
@@ -148,14 +235,193 @@ export class WorkbenchServer {
         return;
       }
 
+      // Don't interleave with Gemini's own live output or an open permission prompt --
+      // if it's mid-output, skip this tick; the 15s fallback poll (or the next
+      // task_state_changed event) will retry once it goes idle. Only a successful
+      // write below marks the task as "already notified".
+      if (!this.terminalManager.isIdle('gemini')) {
+        return;
+      }
+
       this._lastAutoPulledTaskId = targetTask.correlationId;
       this._lastAutoPullTime = now;
-      logger.info('TERMINAL:AUTO_PULL', `Auto-triggering 'check queue' into Gemini ConPTY for queued task ${targetTask.correlationId}`, {
+      // Named handover instead of the old ambiguous "check queue" text: tells Gemini
+      // exactly which task and which tools to call, rather than relying on it to infer
+      // intent from an unrecognized phrase.
+      const handoverMessage = `A new task is waiting in your inbox (correlationId: ${targetTask.correlationId}). Call get_inbox to see it, then claim_task to pick it up.`;
+      logger.info('TERMINAL:AUTO_PULL', `Notifying Gemini ConPTY of queued task ${targetTask.correlationId}`, {
         correlationId: targetTask.correlationId
       });
-      this.terminalManager.write('gemini', 'check queue\r');
+      // Write the text and the submitting Enter as two separate writes with a short
+      // gap. A single write() containing the text plus a trailing \r arrives as one
+      // chunk with no inter-character timing -- Gemini's ink-based input treats that
+      // shape as a paste, which inserts the content but does NOT auto-submit it (the
+      // user has to press Enter themselves). Splitting it mirrors real typing closely
+      // enough that the terminal treats the final \r as a genuine submit keystroke.
+      this.terminalManager.write('gemini', handoverMessage);
+      setTimeout(() => {
+        try {
+          this.terminalManager.write('gemini', '\r');
+        } catch (err) {
+          logger.warn('TERMINAL:AUTO_PULL_WARN', `Failed to submit handover message: ${err.message}`);
+        }
+      }, 150);
     } catch (err) {
       logger.warn('TERMINAL:AUTO_PULL_WARN', `Auto-pull trigger error: ${err.message}`);
+    }
+  }
+
+  // Records whichever Claude/Gemini CLI session ids are currently active as a pair, so
+  // resuming the Claude side later can automatically bring its Gemini side back too.
+  _recordSessionPairing() {
+    try {
+      const claudeId = this.terminalManager.getStatus('claude').cliSessionId;
+      const geminiId = this.terminalManager.getStatus('gemini').cliSessionId;
+      this.sessionPairings.recordActive({ claudeSessionId: claudeId, geminiSessionId: geminiId });
+    } catch (err) {
+      logger.warn('SESSION_PAIRINGS:RECORD_ERROR', `Failed to record session pairing: ${err.message}`);
+    }
+  }
+
+  // Merges persisted pairing metadata with each CLI's own live, authoritative session
+  // store (CliSessionRegistry), so the list only ever offers sessions that genuinely
+  // exist and are genuinely resumable -- a pairing entry referencing an id neither CLI
+  // actually persisted (e.g. a terminal opened and closed with no real exchange) is
+  // dropped rather than shown as a dead "ghost" entry.
+  async _buildMergedSessionList() {
+    const [realSessions, pairs] = await Promise.all([
+      this.cliSessionRegistry.list(),
+      Promise.resolve(this.sessionPairings.list())
+    ]);
+
+    const realClaudeById = new Map(realSessions.filter((s) => s.agent === 'claude').map((s) => [s.id, s]));
+    const realGeminiById = new Map(realSessions.filter((s) => s.agent === 'gemini').map((s) => [s.id, s]));
+
+    const merged = [];
+    const usedClaudeIds = new Set();
+    const usedGeminiIds = new Set();
+
+    for (const pair of pairs) {
+      const claudeReal = pair.claudeSessionId ? realClaudeById.get(pair.claudeSessionId) : null;
+      const geminiReal = pair.geminiSessionId ? realGeminiById.get(pair.geminiSessionId) : null;
+      if (!claudeReal && !geminiReal) continue; // neither side ever actually persisted -- drop
+
+      const cId = claudeReal ? claudeReal.id : null;
+      const gId = geminiReal ? geminiReal.id : null;
+
+      // Prevent duplicate merged entries across multiple pairing references
+      const alreadyMerged = merged.some((m) => m.claudeSessionId === cId && m.geminiSessionId === gId);
+      if (alreadyMerged) continue;
+
+      if (claudeReal) usedClaudeIds.add(claudeReal.id);
+      if (geminiReal) usedGeminiIds.add(geminiReal.id);
+
+      merged.push({
+        claudeSessionId: cId,
+        geminiSessionId: gId,
+        title: claudeReal ? claudeReal.title : geminiReal.title,
+        lastActiveAt: [claudeReal?.lastActiveAt, geminiReal?.lastActiveAt].filter(Boolean).sort().pop()
+      });
+    }
+
+    // Any real Claude session not referenced by any pair gets its own entry so it is
+    // never dropped on restart, termination, or buffer clearing.
+    for (const [id, s] of realClaudeById) {
+      if (!usedClaudeIds.has(id)) {
+        merged.push({ claudeSessionId: id, geminiSessionId: null, title: s.title, lastActiveAt: s.lastActiveAt });
+      }
+    }
+
+    // Any real Gemini session not referenced by any pair is one that was never paired
+    // with a Claude session at all -- i.e. genuinely used standalone -- and gets its
+    // own entry per the user's own framing of this feature.
+    for (const [id, s] of realGeminiById) {
+      if (!usedGeminiIds.has(id)) {
+        merged.push({ claudeSessionId: null, geminiSessionId: id, title: s.title, lastActiveAt: s.lastActiveAt });
+      }
+    }
+
+    merged.sort((a, b) => new Date(b.lastActiveAt).getTime() - new Date(a.lastActiveAt).getTime());
+    return merged;
+  }
+
+  _handleGeminiApprovalPrompt(snapshot) {
+    try {
+      const claimedClaudeDelegatedTasks = this.intercomService
+        ? this.intercomService.getAllDelegations().filter(
+            (t) => t.toAgent === 'gemini' && t.fromAgent === 'claude' &&
+                   (t.state === 'CLAIMED' || t.state === 'RUNNING')
+          )
+        : [];
+
+      const result = evaluateGeminiApprovalPrompt(snapshot, {
+        claimedClaudeDelegatedTasks,
+        sleepMode: this._geminiSleepMode
+      });
+
+      if (!result.isPrompt) {
+        // Gemini's output has moved past any recognized prompt -- if we had it marked
+        // as blocked, the human must have answered it directly in the terminal.
+        if (this._geminiApprovalBlock) {
+          logger.info('GEMINI_APPROVAL:RESOLVED', 'Gemini approval prompt no longer present; clearing block', {
+            correlationId: this._geminiApprovalBlock.correlationId
+          });
+          this._geminiApprovalBlock = null;
+        }
+        return;
+      }
+
+      if (result.decision === 'AUTO_APPROVE') {
+        if (this._lastApprovalSnapshot === snapshot) return; // cheap guard against re-firing on an unchanged buffer
+        this._lastApprovalSnapshot = snapshot;
+        this._geminiApprovalBlock = null;
+        this.terminalManager.write('gemini', '1\r');
+        logger.info('GEMINI_APPROVAL:AUTO_APPROVED', `Auto-approved Gemini permission prompt (category: ${result.reason})`, {
+          command: result.command,
+          reason: result.reason,
+          sleepMode: this._geminiSleepMode
+        });
+        this.broadcastEvent('gemini_approval', {
+          decision: 'AUTO_APPROVED',
+          command: result.command,
+          reason: result.reason,
+          sleepMode: this._geminiSleepMode,
+          timestamp: Date.now()
+        });
+      } else {
+        // Escalated: the human decides, never Claude. Record it against whichever task
+        // is currently claimed/running so Claude's status polls can see it and wait for
+        // the user, instead of the delegate_to_gemini call just timing out silently.
+        const activeTask = claimedClaudeDelegatedTasks[0] || null;
+        const alreadyBlockedOnSame = this._geminiApprovalBlock &&
+          this._geminiApprovalBlock.command === result.command &&
+          this._geminiApprovalBlock.reason === result.reason;
+
+        this._geminiApprovalBlock = {
+          correlationId: activeTask ? activeTask.correlationId : null,
+          command: result.command || null,
+          reason: result.reason,
+          since: alreadyBlockedOnSame ? this._geminiApprovalBlock.since : Date.now()
+        };
+
+        logger.info('GEMINI_APPROVAL:ESCALATED', `Left Gemini permission prompt for human review (${result.reason})`, {
+          command: result.command || null,
+          reason: result.reason,
+          correlationId: this._geminiApprovalBlock.correlationId
+        });
+
+        if (!alreadyBlockedOnSame) {
+          this.broadcastEvent('gemini_approval', {
+            decision: 'ESCALATED',
+            command: result.command || null,
+            reason: result.reason,
+            correlationId: this._geminiApprovalBlock.correlationId,
+            timestamp: Date.now()
+          });
+        }
+      }
+    } catch (err) {
+      logger.warn('GEMINI_APPROVAL:HANDLER_ERROR', `Approval prompt handler error: ${err.message}`);
     }
   }
 
@@ -301,6 +567,7 @@ export class WorkbenchServer {
 
         // Start or attach to existing terminal with scrollback replay
         this.terminalManager.startTerminal(terminalId, { cols: 80, rows: 24 }, currentDataHandler, currentExitHandler);
+        this._recordSessionPairing();
         this.broadcastEvent('terminal_status', this.terminalManager.getAllStatuses());
       };
 
@@ -342,6 +609,7 @@ export class WorkbenchServer {
 
       ws.on('close', () => {
         if (authTimer) clearTimeout(authTimer);
+        this._recordSessionPairing();
         if (currentDataHandler || currentExitHandler) {
           this.terminalManager.detachListener(terminalId, currentDataHandler, currentExitHandler);
         }
@@ -396,8 +664,49 @@ export class WorkbenchServer {
         projectCwd: this.currentProjectCwd,
         appDir: this.cwd,
         allowedRoots: this.workspaceAuth ? this.workspaceAuth.getAllowedRoots() : [this.cwd],
-        terminals: this.terminalManager.getAllStatuses()
+        terminals: this.terminalManager.getAllStatuses(),
+        geminiSleepMode: this._geminiSleepMode
       }));
+    }
+
+    // Gemini Sleep Mode: human-operated toggle for unattended shell auto-approval.
+    // See the _geminiSleepMode field comment in the constructor and
+    // gemini_approval_policy.js for exactly what this does and does not bypass.
+    if (pathname === '/api/gemini/sleep-mode' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ enabled: this._geminiSleepMode }));
+    }
+
+    if (pathname === '/api/gemini/sleep-mode' && req.method === 'POST') {
+      try {
+        const body = await this._readBody(req, res);
+        const data = JSON.parse(body);
+        if (typeof data.enabled !== 'boolean') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: '"enabled" boolean is required' }));
+        }
+
+        const previous = this._geminiSleepMode;
+        this._geminiSleepMode = data.enabled;
+
+        if (previous !== this._geminiSleepMode) {
+          logger.info(
+            this._geminiSleepMode ? 'GEMINI_SLEEP_MODE:ENABLED' : 'GEMINI_SLEEP_MODE:DISABLED',
+            `Gemini sleep mode ${this._geminiSleepMode ? 'enabled' : 'disabled'} by human operator`,
+            { enabled: this._geminiSleepMode }
+          );
+          this.broadcastEvent('gemini_sleep_mode_changed', {
+            enabled: this._geminiSleepMode,
+            timestamp: Date.now()
+          });
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ enabled: this._geminiSleepMode }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+      }
     }
 
     // Workspace Project Directory Endpoints
@@ -447,7 +756,7 @@ export class WorkbenchServer {
 
     if (pathname === '/api/workspace/browse' && req.method === 'POST') {
       try {
-        const selectedPath = await openWindowsFolderPicker();
+        const selectedPath = await openFolderPicker();
         if (!selectedPath) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ cancelled: true, projectCwd: this.currentProjectCwd }));
@@ -484,7 +793,7 @@ export class WorkbenchServer {
     }
 
     // 3. Terminals control
-    const termActionMatch = pathname.match(/^\/api\/terminals\/([a-zA-Z0-9_-]+)\/(start|restart|terminate)$/);
+    const termActionMatch = pathname.match(/^\/api\/terminals\/([a-zA-Z0-9_-]+)\/(start|restart|terminate|clear)$/);
     if (termActionMatch && req.method === 'POST') {
       const termId = termActionMatch[1];
       const action = termActionMatch[2];
@@ -498,10 +807,16 @@ export class WorkbenchServer {
 
         if (action === 'start') {
           this.terminalManager.startTerminal(termId);
+          this._recordSessionPairing();
         } else if (action === 'restart') {
+          this._recordSessionPairing();
           await this.terminalManager.restartTerminal(termId);
+          this._recordSessionPairing();
         } else if (action === 'terminate') {
+          this._recordSessionPairing();
           await this.terminalManager.terminate(termId);
+        } else if (action === 'clear') {
+          this.terminalManager.clearScrollback(termId);
         }
 
         const status = this.terminalManager.getStatus(termId);
@@ -521,6 +836,92 @@ export class WorkbenchServer {
           action,
           error: err.message
         });
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: err.message }));
+      }
+    }
+
+    // 3b. CLI session history: Claude sessions are the primary unit; a Gemini session
+    // Claude delegated to is merged under its paired Claude session rather than listed
+    // separately, and only appears on its own when it was genuinely used standalone.
+    if (pathname === '/api/sessions' && req.method === 'GET') {
+      try {
+        const sessions = await this._buildMergedSessionList();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ sessions }));
+      } catch (err) {
+        logger.warn('API:SESSIONS_LIST_ERROR', `Failed to build session list: ${err.message}`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ sessions: [] }));
+      }
+    }
+
+    if (pathname === '/api/sessions/preflight' && req.method === 'POST') {
+      try {
+        const bodyStr = await this._readBody(req, res);
+        const { sessionId, agent, expectedFiles = [], hydrate = false } = JSON.parse(bodyStr || '{}');
+
+        if (!sessionId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'sessionId is required' }));
+        }
+
+        const preflight = await this.transcriptMirror.checkPreflight({
+          sessionId,
+          agent,
+          expectedFiles,
+          hydrate,
+          projectCwd: this.currentProjectCwd
+        });
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(preflight));
+      } catch (err) {
+        logger.error('API:SESSION_PREFLIGHT_ERROR', `Preflight check failed: ${err.message}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: err.message }));
+      }
+    }
+
+    if (pathname === '/api/sessions/resume' && req.method === 'POST') {
+      try {
+        const body = await this._readBody(req, res);
+        const { claudeSessionId, geminiSessionId } = JSON.parse(body || '{}');
+        if (!claudeSessionId && !geminiSessionId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'claudeSessionId and/or geminiSessionId is required' }));
+        }
+
+        logger.info('API:SESSION_RESUME_REQUEST', 'Resuming session', { claudeSessionId, geminiSessionId });
+
+        // Resume whichever side(s) this session actually has -- one click restores the
+        // whole work session, not just the terminal the user happened to click from.
+        if (claudeSessionId) {
+          const resClaude = this.transcriptMirror.restoreClaude(claudeSessionId, this.currentProjectCwd);
+          if (!resClaude.exists) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: `Claude session ${claudeSessionId} transcript not found locally or in mirrored sessions` }));
+          }
+          await this.terminalManager.restartTerminal('claude', { resumeSessionId: claudeSessionId });
+        }
+        if (geminiSessionId) {
+          const resGemini = this.transcriptMirror.restoreGemini(geminiSessionId, this.currentProjectCwd);
+          if (!resGemini.exists) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: `Gemini session ${geminiSessionId} chat not found locally or in mirrored sessions` }));
+          }
+          await this.terminalManager.restartTerminal('gemini', { resumeSessionId: geminiSessionId });
+        }
+        this._recordSessionPairing();
+
+        this.broadcastEvent('terminal_status', this.terminalManager.getAllStatuses());
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          claude: claudeSessionId ? this.terminalManager.getStatus('claude') : null,
+          gemini: geminiSessionId ? this.terminalManager.getStatus('gemini') : null
+        }));
+      } catch (err) {
+        logger.error('API:SESSION_RESUME_ERROR', `Session resume failed: ${err.message}`, { error: err.message });
         res.writeHead(400, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: err.message }));
       }
@@ -782,8 +1183,20 @@ export class WorkbenchServer {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'Delegation not found' }));
       }
+      // Surface a pending Gemini approval prompt on its task's status, so a client
+      // polling this (e.g. get_delegation_status) can see *why* Gemini looks stuck
+      // instead of just timing out -- and knows the decision is the human's, not
+      // Claude's, to make.
+      const responseBody = { ...task };
+      if (this._geminiApprovalBlock && this._geminiApprovalBlock.correlationId === task.correlationId) {
+        responseBody.geminiApprovalBlock = {
+          ...this._geminiApprovalBlock,
+          waitingSeconds: Math.round((Date.now() - this._geminiApprovalBlock.since) / 1000),
+          note: 'Gemini is holding on its own permission prompt for this command/file. This requires the human to approve or reject it directly in the Gemini terminal -- do not assume approval and do not proceed as if it were granted.'
+        };
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify(task));
+      return res.end(JSON.stringify(responseBody));
     }
 
     const waitMatch = pathname.match(/^\/api\/intercom\/tasks\/([a-zA-Z0-9_-]+)\/wait$/);
@@ -1014,10 +1427,16 @@ export class WorkbenchServer {
 
   async shutdown() {
     console.log('[WorkbenchServer] Shutting down server and all child processes...');
+    this._recordSessionPairing();
 
     if (this._autoPullInterval) {
       clearInterval(this._autoPullInterval);
       this._autoPullInterval = null;
+    }
+
+    if (this._geminiMcpHealthInterval) {
+      clearInterval(this._geminiMcpHealthInterval);
+      this._geminiMcpHealthInterval = null;
     }
 
     for (const ws of this.eventSockets) {

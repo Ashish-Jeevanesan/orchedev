@@ -28,7 +28,8 @@ const SVG_ICONS = {
   'chevron-right': '<polyline points="9 18 15 12 9 6"/>',
   clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
   power: '<path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/>',
-  send: '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>'
+  send: '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>',
+  moon: '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>'
 };
 
 export function getIcon(name, size = 14, className = 'icon-svg') {
@@ -49,6 +50,7 @@ export function initIcons() {
     'icon-modal-warn': getIcon('alert-triangle', 18),
     'icon-impact-shield': getIcon('shield-check', 16),
     'icon-appr-check': getIcon('check', 14),
+    'icon-sleep-mode': getIcon('moon', 13),
     'ws-label-folder': `${getIcon('folder', 13)} Working Folder:`,
     'btn-copy-ws-path': `${getIcon('copy', 11)} Copy`,
     'btn-term-start': `${getIcon('play', 11)} Start`,

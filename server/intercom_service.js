@@ -140,6 +140,7 @@ export class IntercomService {
     this.cwd = path.resolve(cwd);
     this.broadcastEvent = eventBroadcaster; // (type, payload) => void
     this.storageFile = path.join(this.cwd, '.workbench_tasks.json');
+    this.tasksDir = path.join(this.cwd, '.workbench', 'tasks');
 
     // Centralized CWD authorization service
     this.workspaceAuth = workspaceAuth || new WorkspaceAuthorizationService({
@@ -225,28 +226,85 @@ export class IntercomService {
 
   _loadPersistedTasks() {
     try {
-      if (!fs.existsSync(this.storageFile)) return;
+      const taskMap = new Map();
 
-      const raw = fs.readFileSync(this.storageFile, 'utf8');
-      if (!raw || !raw.trim()) return;
+      const getTaskTimestamp = (task) => {
+        if (!task) return 0;
+        let ts = task.updatedAt || task.completedAt || task.approvedAt || task.createdAt || 0;
+        if (typeof ts === 'string') ts = new Date(ts).getTime();
+        if (Array.isArray(task.stateHistory) && task.stateHistory.length > 0) {
+          const lastHist = task.stateHistory[task.stateHistory.length - 1];
+          if (lastHist && lastHist.timestamp) {
+            const hts = typeof lastHist.timestamp === 'string' ? new Date(lastHist.timestamp).getTime() : lastHist.timestamp;
+            if (hts > ts) ts = hts;
+          }
+        }
+        return ts;
+      };
 
-      let tasks;
-      try {
-        tasks = JSON.parse(raw);
-      } catch (parseErr) {
-        // Emergency backup of corrupted file before starting fresh
-        const backupPath = `${this.storageFile}.corrupt_${Date.now()}`;
-        try {
-          fs.writeFileSync(backupPath, raw, 'utf8');
-          logger.error('INTERCOM:CORRUPTION_BACKUP_CREATED', `Corrupted tasks file preserved at ${backupPath}`, {
-            error: parseErr.message,
-            backupPath
-          });
-        } catch (e) {}
-        throw parseErr;
+      const ingestTask = (task) => {
+        if (!task || !task.correlationId) return;
+        const existing = taskMap.get(task.correlationId);
+        if (!existing || getTaskTimestamp(task) >= getTaskTimestamp(existing)) {
+          taskMap.set(task.correlationId, task);
+        }
+      };
+
+      // 1. Read primary storageFile if present
+      if (fs.existsSync(this.storageFile)) {
+        const raw = fs.readFileSync(this.storageFile, 'utf8');
+        if (raw && raw.trim()) {
+          try {
+            const tasks = JSON.parse(raw);
+            if (Array.isArray(tasks)) {
+              for (const t of tasks) ingestTask(t);
+            }
+          } catch (parseErr) {
+            const backupPath = `${this.storageFile}.corrupt_${Date.now()}`;
+            try {
+              fs.writeFileSync(backupPath, raw, 'utf8');
+              logger.error('INTERCOM:CORRUPTION_BACKUP_CREATED', `Corrupted tasks file preserved at ${backupPath}`, {
+                error: parseErr.message,
+                backupPath
+              });
+            } catch (e) {}
+            throw parseErr;
+          }
+        }
       }
 
-      if (Array.isArray(tasks)) {
+      // 2. Scan and merge any OneDrive conflict copies (.workbench_tasks-*.json)
+      try {
+        const cwdFiles = fs.readdirSync(this.cwd);
+        for (const file of cwdFiles) {
+          if (file.startsWith('.workbench_tasks-') && file.endsWith('.json')) {
+            try {
+              const conflictRaw = fs.readFileSync(path.join(this.cwd, file), 'utf8');
+              const conflictTasks = JSON.parse(conflictRaw);
+              if (Array.isArray(conflictTasks)) {
+                for (const t of conflictTasks) ingestTask(t);
+              }
+            } catch (e) {}
+          }
+        }
+      } catch (e) {}
+
+      // 3. Scan and merge partitioned task files in .workbench/tasks/<id>.json
+      if (fs.existsSync(this.tasksDir)) {
+        try {
+          const taskFiles = fs.readdirSync(this.tasksDir).filter(f => f.endsWith('.json'));
+          for (const f of taskFiles) {
+            try {
+              const rawTask = fs.readFileSync(path.join(this.tasksDir, f), 'utf8');
+              const t = JSON.parse(rawTask);
+              ingestTask(t);
+            } catch (e) {}
+          }
+        } catch (e) {}
+      }
+
+      const tasks = Array.from(taskMap.values());
+      if (tasks.length > 0) {
         const now = Date.now();
         let recoveryChanges = false;
 
@@ -326,7 +384,7 @@ export class IntercomService {
           this.delegations.set(task.correlationId, task);
         }
 
-        logger.info('INTERCOM:TASKS_LOADED', `Loaded ${this.delegations.size} persisted tasks from ${this.storageFile}`);
+        logger.info('INTERCOM:TASKS_LOADED', `Loaded ${this.delegations.size} persisted tasks from disk sources`);
         if (recoveryChanges) {
           this._persist();
         }
@@ -376,15 +434,32 @@ export class IntercomService {
 
   async _atomicWriteWithRetry() {
     const serialized = Array.from(this.delegations.values());
+
+    // 1. Partitioned persistence: write each task to .workbench/tasks/<correlationId>.json
+    try {
+      if (!fs.existsSync(this.tasksDir)) {
+        fs.mkdirSync(this.tasksDir, { recursive: true });
+      }
+      for (const task of serialized) {
+        if (task.correlationId) {
+          const taskFile = path.join(this.tasksDir, `${task.correlationId}.json`);
+          await fs.promises.writeFile(taskFile, JSON.stringify(task, null, 2), 'utf8');
+        }
+      }
+    } catch (err) {
+      logger.warn('INTERCOM:TASKS_DIR_WRITE_WARN', `Failed to write partitioned task files: ${err.message}`);
+    }
+
+    // 2. Aggregate persistence with atomic rename
     const tempFile = path.join(
       this.cwd,
       `.workbench_tasks.json.tmp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
     );
 
-    // 1. Write full content to unique temporary file
+    // Write full content to unique temporary file
     await fs.promises.writeFile(tempFile, JSON.stringify(serialized, null, 2), 'utf8');
 
-    // 2. Windows atomic rename with exponential backoff retry for transient EPERM/EBUSY locks
+    // Windows atomic rename with exponential backoff retry for transient EPERM/EBUSY locks
     let lastErr = null;
     for (let attempt = 1; attempt <= 5; attempt++) {
       try {

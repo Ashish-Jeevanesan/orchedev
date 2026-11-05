@@ -804,6 +804,13 @@ body {
 .btn-danger { background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.4); color: var(--color-danger); }
 .btn-danger:hover { background: var(--color-danger); color: #fff; }
 
+#btn-gemini-sleep-mode.active {
+  background: rgba(245, 158, 11, 0.18);
+  border-color: rgba(245, 158, 11, 0.5);
+  color: var(--color-warning);
+}
+#btn-gemini-sleep-mode.active:hover { background: rgba(245, 158, 11, 0.28); }
+
 /* Empty States */
 .empty-state {
   color: var(--text-dim);
@@ -1031,6 +1038,49 @@ body {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+/* Session History Modal */
+.sessions-filter-tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.sessions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.session-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+}
+
+.session-row-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.session-title {
+  font-size: 13px;
+  color: var(--text-main);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
 }
 
 .btn-success {

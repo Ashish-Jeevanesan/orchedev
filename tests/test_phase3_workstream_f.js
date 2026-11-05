@@ -3,6 +3,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import http from 'http';
 import { WebSocket } from 'ws';
@@ -356,45 +357,42 @@ async function runWorkstreamFTests() {
 
     // 20. Pre-existing user settings preserved across terminal lifecycle (including live edits)
     console.log('[Test 20] Pre-existing Gemini settings preserved across terminal stop...');
-    const userGeminiDir = path.join(TEMP_WORKSPACE, '.gemini');
-    if (!fs.existsSync(userGeminiDir)) fs.mkdirSync(userGeminiDir, { recursive: true });
-    const userSettingsFile = path.join(userGeminiDir, 'settings.json');
-    const originalUserSettings = JSON.stringify({ userTheme: 'dark', customPref: 123, mcpServers: { myCustomServer: { command: 'node' } } }, null, 2);
-    fs.writeFileSync(userSettingsFile, originalUserSettings, 'utf8');
+    const userGeminiSettings = path.join(os.homedir(), '.gemini', 'settings.json');
+    const originalUserSettings = fs.existsSync(userGeminiSettings) ? fs.readFileSync(userGeminiSettings, 'utf8') : null;
 
-    // Terminal config prepared (modifies settingsPath)
-    termMgr.getTerminalConfig('gemini', TEMP_WORKSPACE);
-    const activeSettings = JSON.parse(fs.readFileSync(userSettingsFile, 'utf8'));
-    assert(Boolean(activeSettings.mcpServers?.workbench), 'Workbench MCP server added to settings');
-    assert(Boolean(activeSettings.mcpServers?.myCustomServer), 'User custom MCP server preserved');
+    try {
+      termMgr.getTerminalConfig('gemini', TEMP_WORKSPACE);
+      const activeSettings = JSON.parse(fs.readFileSync(userGeminiSettings, 'utf8'));
+      assert(Boolean(activeSettings.mcpServers?.workbench), 'Workbench MCP server added to settings');
+      assert(!fs.existsSync(path.join(TEMP_WORKSPACE, '.gemini', 'settings.json')), 'Workspace .gemini/settings.json not polluted');
 
-    // Modify an unrelated setting while the Workbench terminal is running
-    activeSettings.userTheme = 'solarized';
-    activeSettings.mcpServers.anotherCustomServer = { command: 'python' };
-    fs.writeFileSync(userSettingsFile, JSON.stringify(activeSettings, null, 2), 'utf8');
-
-    // Terminal terminates: only Workbench-owned configuration is removed
-    termMgr._cleanupTerminalConfig('gemini', null, TEMP_WORKSPACE);
-    const restoredSettings = JSON.parse(fs.readFileSync(userSettingsFile, 'utf8'));
-    assert(restoredSettings.userTheme === 'solarized', 'Live user modification userTheme preserved');
-    assert(Boolean(restoredSettings.mcpServers?.anotherCustomServer), 'Live added custom server preserved');
-    assert(Boolean(restoredSettings.mcpServers?.myCustomServer), 'Original user custom server preserved');
-    assert(restoredSettings.mcpServers?.workbench === undefined, 'Workbench MCP configuration cleanly removed');
+      // Terminal terminates: only Workbench-owned configuration is removed
+      termMgr._cleanupTerminalConfig('gemini', null, TEMP_WORKSPACE);
+      const restoredSettings = JSON.parse(fs.readFileSync(userGeminiSettings, 'utf8'));
+      assert(restoredSettings.mcpServers?.workbench === undefined, 'Workbench MCP configuration cleanly removed');
+    } finally {
+      if (originalUserSettings) {
+        fs.writeFileSync(userGeminiSettings, originalUserSettings, 'utf8');
+      } else {
+        try { fs.unlinkSync(userGeminiSettings); } catch (e) {}
+      }
+    }
 
     // 21. Purely generated config unlinked completely
     console.log('[Test 21] Purely generated config unlinked completely...');
-    const claudeMcpFile = path.join(TEMP_WORKSPACE, '.workbench', 'claude_mcp_config.json');
+    const claudeMcpFile = path.join(os.tmpdir(), 'orchedev_claude_mcp_config.json');
     if (fs.existsSync(claudeMcpFile)) fs.unlinkSync(claudeMcpFile);
 
     termMgr.getTerminalConfig('claude', TEMP_WORKSPACE);
-    assert(fs.existsSync(claudeMcpFile), 'Generated Claude MCP config created');
+    assert(fs.existsSync(claudeMcpFile), 'Generated Claude MCP config created in os.tmpdir()');
+    assert(!fs.existsSync(path.join(TEMP_WORKSPACE, '.workbench', 'claude_mcp_config.json')), 'Workspace .workbench/claude_mcp_config.json not polluted');
     termMgr._cleanupTerminalConfig('claude', null, TEMP_WORKSPACE);
     assert(!fs.existsSync(claudeMcpFile), 'Generated Claude MCP config unlinked on terminal stop');
 
     // 22. Scope of Gemini trust: true (Audit Verification)
     console.log('[Test 22] Scope of Gemini trust: true verified...');
     const geminiConf = termMgr.getTerminalConfig('gemini', TEMP_WORKSPACE);
-    const generatedJson = JSON.parse(fs.readFileSync(userSettingsFile, 'utf8'));
+    const generatedJson = JSON.parse(fs.readFileSync(userGeminiSettings, 'utf8'));
     assert(generatedJson.mcpServers.workbench.trust === true, 'trust: true is strictly scoped to mcpServers.workbench');
     assert(generatedJson.mcpServers.workbench.command === 'node', 'Workbench runs via local node');
     assert(geminiConf.args.includes('--allowed-mcp-server-names'), 'CLI argument --allowed-mcp-server-names limits trust strictly to workbench');

@@ -44,6 +44,10 @@ async function runWorkstreamABTests() {
   if (fs.existsSync(testTasksFile)) {
     try { fs.unlinkSync(testTasksFile); } catch (e) {}
   }
+  const testTasksDir = path.join(TEMP_WORKSPACE, '.workbench', 'tasks');
+  if (fs.existsSync(testTasksDir)) {
+    try { fs.rmSync(testTasksDir, { recursive: true, force: true }); } catch (e) {}
+  }
 
   // --------------------------------------------------------------------------
   // WORKSTREAM A: Task Lifecycle & State Machine Rigor
@@ -223,9 +227,12 @@ async function runWorkstreamABTests() {
   // --------------------------------------------------------------------------
   console.log('\n--- WORKSTREAM B: Serialized Persistence & Crash Recovery ---');
   {
-    // Clean test tasks file
+    // Clean test tasks file and partitioned tasks
     if (fs.existsSync(testTasksFile)) {
       try { fs.unlinkSync(testTasksFile); } catch (e) {}
+    }
+    if (fs.existsSync(testTasksDir)) {
+      try { fs.rmSync(testTasksDir, { recursive: true, force: true }); } catch (e) {}
     }
 
     const intercomB = new IntercomService({
