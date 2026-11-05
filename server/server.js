@@ -106,6 +106,13 @@ export class WorkbenchServer {
     // get_delegation_status / get_inbox polls can see *why* Gemini looks stuck instead
     // of the delegate_to_gemini call just timing out silently (see BUGS.md BUG-001).
     this._geminiApprovalBlock = null;
+    // "Sleep Mode": a human-operated toggle (header button, /api/gemini/sleep-mode) that
+    // widens Gemini's shell-prompt auto-approval beyond gemini_approval_policy.js's
+    // SAFE_CATEGORIES allowlist -- for unattended stretches (e.g. overnight) where no one
+    // is at the terminal to answer prompts. The untrusted-input-marker and
+    // DANGEROUS_PATTERNS vetoes in that policy are never affected by this flag. Off by
+    // default on every process start; never persisted across restarts.
+    this._geminiSleepMode = false;
   }
 
   async start() {
@@ -284,12 +291,19 @@ export class WorkbenchServer {
       const geminiReal = pair.geminiSessionId ? realGeminiById.get(pair.geminiSessionId) : null;
       if (!claudeReal && !geminiReal) continue; // neither side ever actually persisted -- drop
 
+      const cId = claudeReal ? claudeReal.id : null;
+      const gId = geminiReal ? geminiReal.id : null;
+
+      // Prevent duplicate merged entries across multiple pairing references
+      const alreadyMerged = merged.some((m) => m.claudeSessionId === cId && m.geminiSessionId === gId);
+      if (alreadyMerged) continue;
+
       if (claudeReal) usedClaudeIds.add(claudeReal.id);
       if (geminiReal) usedGeminiIds.add(geminiReal.id);
 
       merged.push({
-        claudeSessionId: claudeReal ? claudeReal.id : null,
-        geminiSessionId: geminiReal ? geminiReal.id : null,
+        claudeSessionId: cId,
+        geminiSessionId: gId,
         title: claudeReal ? claudeReal.title : geminiReal.title,
         lastActiveAt: [claudeReal?.lastActiveAt, geminiReal?.lastActiveAt].filter(Boolean).sort().pop()
       });
@@ -325,7 +339,10 @@ export class WorkbenchServer {
           )
         : [];
 
-      const result = evaluateGeminiApprovalPrompt(snapshot, { claimedClaudeDelegatedTasks });
+      const result = evaluateGeminiApprovalPrompt(snapshot, {
+        claimedClaudeDelegatedTasks,
+        sleepMode: this._geminiSleepMode
+      });
 
       if (!result.isPrompt) {
         // Gemini's output has moved past any recognized prompt -- if we had it marked
@@ -346,12 +363,14 @@ export class WorkbenchServer {
         this.terminalManager.write('gemini', '1\r');
         logger.info('GEMINI_APPROVAL:AUTO_APPROVED', `Auto-approved Gemini permission prompt (category: ${result.reason})`, {
           command: result.command,
-          reason: result.reason
+          reason: result.reason,
+          sleepMode: this._geminiSleepMode
         });
         this.broadcastEvent('gemini_approval', {
           decision: 'AUTO_APPROVED',
           command: result.command,
           reason: result.reason,
+          sleepMode: this._geminiSleepMode,
           timestamp: Date.now()
         });
       } else {
@@ -630,8 +649,49 @@ export class WorkbenchServer {
         projectCwd: this.currentProjectCwd,
         appDir: this.cwd,
         allowedRoots: this.workspaceAuth ? this.workspaceAuth.getAllowedRoots() : [this.cwd],
-        terminals: this.terminalManager.getAllStatuses()
+        terminals: this.terminalManager.getAllStatuses(),
+        geminiSleepMode: this._geminiSleepMode
       }));
+    }
+
+    // Gemini Sleep Mode: human-operated toggle for unattended shell auto-approval.
+    // See the _geminiSleepMode field comment in the constructor and
+    // gemini_approval_policy.js for exactly what this does and does not bypass.
+    if (pathname === '/api/gemini/sleep-mode' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ enabled: this._geminiSleepMode }));
+    }
+
+    if (pathname === '/api/gemini/sleep-mode' && req.method === 'POST') {
+      try {
+        const body = await this._readBody(req, res);
+        const data = JSON.parse(body);
+        if (typeof data.enabled !== 'boolean') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: '"enabled" boolean is required' }));
+        }
+
+        const previous = this._geminiSleepMode;
+        this._geminiSleepMode = data.enabled;
+
+        if (previous !== this._geminiSleepMode) {
+          logger.info(
+            this._geminiSleepMode ? 'GEMINI_SLEEP_MODE:ENABLED' : 'GEMINI_SLEEP_MODE:DISABLED',
+            `Gemini sleep mode ${this._geminiSleepMode ? 'enabled' : 'disabled'} by human operator`,
+            { enabled: this._geminiSleepMode }
+          );
+          this.broadcastEvent('gemini_sleep_mode_changed', {
+            enabled: this._geminiSleepMode,
+            timestamp: Date.now()
+          });
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ enabled: this._geminiSleepMode }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+      }
     }
 
     // Workspace Project Directory Endpoints
@@ -778,6 +838,33 @@ export class WorkbenchServer {
         logger.warn('API:SESSIONS_LIST_ERROR', `Failed to build session list: ${err.message}`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ sessions: [] }));
+      }
+    }
+
+    if (pathname === '/api/sessions/preflight' && req.method === 'POST') {
+      try {
+        const bodyStr = await this._readBody(req, res);
+        const { sessionId, agent, expectedFiles = [], hydrate = false } = JSON.parse(bodyStr || '{}');
+
+        if (!sessionId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'sessionId is required' }));
+        }
+
+        const preflight = await this.transcriptMirror.checkPreflight({
+          sessionId,
+          agent,
+          expectedFiles,
+          hydrate,
+          projectCwd: this.currentProjectCwd
+        });
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(preflight));
+      } catch (err) {
+        logger.error('API:SESSION_PREFLIGHT_ERROR', `Preflight check failed: ${err.message}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: err.message }));
       }
     }
 

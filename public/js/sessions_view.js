@@ -1,13 +1,7 @@
-// Browse and resume past work sessions. A "session" here is organized around Claude's
-// conversation -- the unit the human actually thinks in -- with whatever Gemini
-// delegation happened inside it following along underneath, rather than as two
-// unrelated-looking entries. A session only shows as "Gemini" on its own when it was
-// genuinely used standalone, with no Claude session paired to it at all.
-//
-// Resuming replays the real session id(s) back to the CLI(s) via their own --resume
-// flag (server/session_pairings.js + cli_session_registry.js do the pairing/merging),
-// so this restores actual conversation history, not just a summary -- and resuming a
-// paired session brings both Claude and Gemini back in one click.
+// public/js/sessions_view.js
+// Browse and resume past work sessions with pre-flight OneDrive hydration checks.
+
+import { dialogService } from './dialog_service.js';
 
 function timeAgo(iso) {
   if (!iso) return '';
@@ -33,6 +27,7 @@ export class SessionsViewController {
     this.currentFilter = 'all';
     this.sessions = [];
     this.isLoading = false;
+    this.preflightCache = new Map(); // sessionId -> { status, unhydratedFiles, message }
   }
 
   init() {
@@ -90,19 +85,55 @@ export class SessionsViewController {
       });
       const data = await res.json();
       this.sessions = Array.isArray(data.sessions) ? data.sessions : [];
+      this._render();
+      // Run pre-flight hydration checks in background
+      this._runBackgroundPreflights();
     } catch (err) {
       this.sessions = [];
       this.listEl.innerHTML = `<div class="empty-state">Failed to load sessions: ${this._escape(err.message)}</div>`;
-      return;
     } finally {
       this.isLoading = false;
     }
-    this._render();
   }
 
-  // 'all' | 'claude' (has a claude session, with or without paired gemini) |
-  // 'gemini' (gemini-only, standalone -- a session with a claude side is never shown
-  // here, since it's not "separately named" Gemini work)
+  async _runBackgroundPreflights() {
+    for (const s of this.sessions) {
+      const targetId = s.claudeSessionId || s.geminiSessionId;
+      const targetAgent = s.claudeSessionId ? 'claude' : 'gemini';
+      if (!targetId || this.preflightCache.has(targetId)) continue;
+
+      try {
+        const res = await fetch('/api/sessions/preflight', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Session-Token': this.token
+          },
+          body: JSON.stringify({ sessionId: targetId, agent: targetAgent })
+        });
+        if (res.ok) {
+          const preflight = await res.json();
+          this.preflightCache.set(targetId, preflight);
+          this._updateRowPreflightState(targetId, preflight);
+        }
+      } catch (e) {}
+    }
+  }
+
+  _updateRowPreflightState(sessionId, preflight) {
+    const btn = this.listEl?.querySelector(`button[data-session-id="${sessionId}"]`);
+    if (!btn) return;
+    btn.dataset.status = preflight.status;
+    if (preflight.status === 'DEHYDRATED') {
+      btn.className = 'btn btn-xs btn-warning btn-session-resume';
+      btn.innerHTML = '☁️ Download & Resume';
+      btn.title = preflight.message || 'Needs hydration from OneDrive';
+    } else if (preflight.status === 'MISSING') {
+      btn.className = 'btn btn-xs btn-outline btn-session-resume';
+      btn.title = preflight.message;
+    }
+  }
+
   _matchesFilter(s) {
     if (this.currentFilter === 'all') return true;
     if (this.currentFilter === 'claude') return !!s.claudeSessionId;
@@ -131,6 +162,13 @@ export class SessionsViewController {
           ? '<span class="session-agent-badge badge badge-sm badge-primary">Claude</span><span class="badge badge-xs badge-outline" title="This session also delegated work to Gemini">+Gemini</span>'
           : '<span class="session-agent-badge badge badge-sm badge-primary">Claude</span>';
 
+      const targetId = s.claudeSessionId || s.geminiSessionId;
+      const cached = this.preflightCache.get(targetId);
+      const isDehydrated = cached?.status === 'DEHYDRATED';
+
+      const btnClass = isDehydrated ? 'btn btn-xs btn-warning btn-session-resume' : 'btn btn-xs btn-primary btn-session-resume';
+      const btnLabel = isDehydrated ? '☁️ Download & Resume' : 'Resume';
+
       return `
       <div class="session-row">
         ${badgeHtml}
@@ -138,16 +176,101 @@ export class SessionsViewController {
           <div class="session-title">${this._escape(s.title)}</div>
           <div class="session-meta">${timeAgo(s.lastActiveAt)}</div>
         </div>
-        <button class="btn btn-xs btn-primary btn-session-resume"
+        <button class="${btnClass}"
+          data-session-id="${this._escape(targetId || '')}"
+          data-status="${this._escape(cached?.status || '')}"
           data-claude-id="${this._escape(s.claudeSessionId || '')}"
-          data-gemini-id="${this._escape(s.geminiSessionId || '')}">Resume</button>
+          data-gemini-id="${this._escape(s.geminiSessionId || '')}">${btnLabel}</button>
       </div>
     `;
     }).join('');
 
     this.listEl.querySelectorAll('.btn-session-resume').forEach((btn) => {
-      btn.addEventListener('click', () => this._resume(btn.dataset.claudeId || null, btn.dataset.geminiId || null));
+      btn.addEventListener('click', () => this._handleResumeClick(btn));
     });
+  }
+
+  async _handleResumeClick(btn) {
+    const claudeId = btn.dataset.claudeId || null;
+    const geminiId = btn.dataset.geminiId || null;
+    const targetId = claudeId || geminiId;
+    const targetAgent = claudeId ? 'claude' : 'gemini';
+
+    const cachedPreflight = this.preflightCache.get(targetId);
+    let status = cachedPreflight?.status;
+
+    // If preflight check hasn't run yet, perform it before resuming
+    if (!status) {
+      btn.disabled = true;
+      btn.textContent = 'Checking...';
+      try {
+        const res = await fetch('/api/sessions/preflight', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Session-Token': this.token
+          },
+          body: JSON.stringify({ sessionId: targetId, agent: targetAgent })
+        });
+        const data = await res.json();
+        status = data.status;
+        this.preflightCache.set(targetId, data);
+      } catch (err) {
+        status = 'MISSING';
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    if (status === 'MISSING') {
+      await dialogService.confirm({
+        title: 'Session History Not Available',
+        message: 'This session cannot be opened yet because its conversation history has not synced to this device from OneDrive. Please check your OneDrive connection and try again.',
+        confirmText: 'Dismiss',
+        cancelText: 'Close',
+        icon: 'alert-triangle'
+      });
+      return;
+    }
+
+    if (status === 'DEHYDRATED') {
+      btn.disabled = true;
+      btn.innerHTML = 'Downloading...';
+      this.onToast('Downloading conversation history from OneDrive...', 'info');
+
+      try {
+        const res = await fetch('/api/sessions/preflight', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Session-Token': this.token
+          },
+          body: JSON.stringify({ sessionId: targetId, agent: targetAgent, hydrate: true })
+        });
+        const data = await res.json();
+        if (data.status === 'READY') {
+          this.preflightCache.set(targetId, data);
+          await this._resume(claudeId, geminiId);
+          return;
+        } else {
+          throw new Error(data.message || 'Download timed out');
+        }
+      } catch (err) {
+        btn.disabled = false;
+        btn.innerHTML = '☁️ Download & Resume';
+        await dialogService.confirm({
+          title: 'Sync Incomplete',
+          message: 'This session cannot be opened yet because its conversation history has not synced to this device from OneDrive. Please check your OneDrive connection and try again.',
+          confirmText: 'Retry Download',
+          cancelText: 'Close',
+          icon: 'cloud'
+        });
+        return;
+      }
+    }
+
+    // Status is READY
+    await this._resume(claudeId, geminiId);
   }
 
   async _resume(claudeSessionId, geminiSessionId) {

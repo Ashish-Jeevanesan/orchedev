@@ -118,7 +118,13 @@ function fileMatchesExpected(fileName, expectedFiles) {
   }) || null;
 }
 
-function evaluateShellPrompt(promptText) {
+// sleepMode is the user-controlled "Sleep Mode" toggle (see server.js / the workbench
+// header button): an opt-in, explicitly logged widening of shell auto-approval for
+// unattended stretches (e.g. overnight). It only widens the SAFE_CATEGORIES allowlist
+// below -- the untrusted-input-marker check and DANGEROUS_PATTERNS veto above are NOT
+// affected by it and stay in force unconditionally. It never applies to edit or skill
+// prompts, only shell execution prompts.
+function evaluateShellPrompt(promptText, sleepMode = false) {
   if (containsUntrustedMarker(promptText)) {
     return { isPrompt: true, decision: 'ESCALATE', reason: 'untrusted-input-marker' };
   }
@@ -135,6 +141,10 @@ function evaluateShellPrompt(promptText) {
   const matched = SAFE_CATEGORIES.find((c) => c.test(command.trim()));
   if (matched) {
     return { isPrompt: true, decision: 'AUTO_APPROVE', reason: matched.name, command };
+  }
+
+  if (sleepMode) {
+    return { isPrompt: true, decision: 'AUTO_APPROVE', reason: 'sleep-mode-all-shell', command };
   }
 
   return { isPrompt: true, decision: 'ESCALATE', reason: 'no-safe-category-match', command };
@@ -188,9 +198,13 @@ function evaluateSkillActivationPrompt(promptText) {
 /**
  * @param {string} promptText - a quiet-output snapshot of the Gemini terminal's raw
  *   PTY output (may include ANSI escape sequences).
- * @param {{claimedClaudeDelegatedTasks?: Array<{correlationId: string, expectedFiles: string[]}>}} [context]
- *   - currently CLAIMED/RUNNING tasks where fromAgent === 'claude' and toAgent === 'gemini',
- *     used only to scope edit-prompt auto-approval to files Claude already declared.
+ * @param {{claimedClaudeDelegatedTasks?: Array<{correlationId: string, expectedFiles: string[]}>, sleepMode?: boolean}} [context]
+ *   - claimedClaudeDelegatedTasks: currently CLAIMED/RUNNING tasks where fromAgent === 'claude'
+ *     and toAgent === 'gemini', used only to scope edit-prompt auto-approval to files Claude
+ *     already declared.
+ *   - sleepMode: user-controlled toggle that widens shell-prompt auto-approval beyond
+ *     SAFE_CATEGORIES to any command that isn't dangerous/untrusted. Has no effect on edit
+ *     or skill-activation prompts.
  * @returns {{isPrompt: boolean, decision?: 'AUTO_APPROVE'|'ESCALATE', reason?: string, command?: string}}
  */
 export function evaluate(promptText, context = {}) {
@@ -198,7 +212,7 @@ export function evaluate(promptText, context = {}) {
     return evaluateEditPrompt(promptText, context);
   }
   if (isShellApprovalPrompt(promptText)) {
-    return evaluateShellPrompt(promptText);
+    return evaluateShellPrompt(promptText, !!context.sleepMode);
   }
   if (isSkillActivationPrompt(promptText)) {
     return evaluateSkillActivationPrompt(promptText);

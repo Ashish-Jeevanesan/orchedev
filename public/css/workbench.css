@@ -804,6 +804,13 @@ body {
 .btn-danger { background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.4); color: var(--color-danger); }
 .btn-danger:hover { background: var(--color-danger); color: #fff; }
 
+#btn-gemini-sleep-mode.active {
+  background: rgba(245, 158, 11, 0.18);
+  border-color: rgba(245, 158, 11, 0.5);
+  color: var(--color-warning);
+}
+#btn-gemini-sleep-mode.active:hover { background: rgba(245, 158, 11, 0.28); }
+
 /* Empty States */
 .empty-state {
   color: var(--text-dim);
