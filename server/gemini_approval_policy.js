@@ -30,6 +30,16 @@ const UNTRUSTED_MARKERS = [
   'sourced from untrusted input'
 ];
 
+// Gemini's prompt is a raw PTY snapshot, so it carries ANSI color/cursor-movement
+// escape sequences (e.g. "\u001b[38;2;255;255;255m", "\u001b[121X"). Those sequences
+// use ';' as a parameter separator and letters as final bytes, so left unstripped they
+// corrupt both command extraction (trailing escape bytes get appended to the "command")
+// and the chaining/piping veto below (a color code's embedded ';' falsely reads as
+// command chaining). Stripped once, at the top of evaluate(), before anything else runs.
+function stripAnsi(text) {
+  return String(text).replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+}
+
 // Broad, Claude-Code-like "read-only, side-effect-free" categories. Matched against
 // the command's leading verb/cmdlet, not the full text, so flags/arguments don't need
 // to be enumerated -- but DANGEROUS_PATTERNS below still runs first as a hard veto.
@@ -54,9 +64,23 @@ const DANGEROUS_PATTERNS = [
   /\b(curl|wget|Invoke-WebRequest|Invoke-RestMethod)\b/i,
   /\bsudo\b/i,
   /reg\s+add|reg\s+delete/i,
-  /[|;&]/, // command chaining/piping: refuse to reason about compound commands
   />/ // any output redirection -- treat as a write even on a "read-only" verb
 ];
+
+// A single PowerShell "call operator" invocation of a quoted path, e.g.
+// & 'C:\Program Files\Git\bin\git.exe' status -- this is how PowerShell invokes an
+// executable whose path contains spaces, not command chaining. Only this one leading
+// occurrence is stripped before the chaining/piping check below; any further &, ;, or |
+// left in the command still vetoes it as a compound command refused rather than reasoned
+// about.
+function stripLeadingCallOperator(cmd) {
+  const match = cmd.match(/^&\s*(?:'[^']*'|"[^"]*")/);
+  return match ? cmd.slice(match[0].length) : cmd;
+}
+
+function hasChainingOrPiping(cmd) {
+  return /[|;&]/.test(stripLeadingCallOperator(cmd));
+}
 
 function containsUntrustedMarker(promptText) {
   const lower = promptText.toLowerCase();
@@ -134,7 +158,7 @@ function evaluateShellPrompt(promptText, sleepMode = false) {
     return { isPrompt: true, decision: 'ESCALATE', reason: 'command-not-parsed' };
   }
 
-  if (DANGEROUS_PATTERNS.some((p) => p.test(command))) {
+  if (hasChainingOrPiping(command) || DANGEROUS_PATTERNS.some((p) => p.test(command))) {
     return { isPrompt: true, decision: 'ESCALATE', reason: 'matches-dangerous-pattern', command };
   }
 
@@ -208,6 +232,7 @@ function evaluateSkillActivationPrompt(promptText) {
  * @returns {{isPrompt: boolean, decision?: 'AUTO_APPROVE'|'ESCALATE', reason?: string, command?: string}}
  */
 export function evaluate(promptText, context = {}) {
+  promptText = stripAnsi(promptText);
   if (isEditApprovalPrompt(promptText)) {
     return evaluateEditPrompt(promptText, context);
   }
