@@ -230,11 +230,42 @@ export class TerminalManager {
     }
   }
 
+  // Gemini CLI layers a PROJECT-level <cwd>/.gemini/settings.json on top of the global
+  // ~/.gemini/settings.json, and project settings win. We only ever write the global
+  // file (see _writeGeminiMcpSettings below) -- but a stale project-level file left over
+  // from before this codebase migrated to the global-only approach (or from a prior,
+  // now-dead instance of this same workbench that happened to run older code) silently
+  // overrides whatever correct port/token we write globally, with NO error or visible
+  // symptom other than MCP staying OFFLINE forever. Confirmed by direct reproduction:
+  // found and neutralized exactly such a file during live debugging, which is what
+  // finally fixed a real MCP:OFFLINE case that writing the global file alone did not.
+  // Called every time we're about to (re)spawn or self-heal Gemini's config, so a stray
+  // project-level override can never silently reappear and shadow the global file again.
+  _neutralizeStaleProjectGeminiSettings(targetCwd) {
+    const projectSettingsPath = path.join(targetCwd, '.gemini', 'settings.json');
+    if (!fs.existsSync(projectSettingsPath)) return;
+    try {
+      const raw = fs.readFileSync(projectSettingsPath, 'utf8');
+      const settings = JSON.parse(raw);
+      if (settings.mcpServers && settings.mcpServers.workbench) {
+        delete settings.mcpServers.workbench;
+        if (Object.keys(settings.mcpServers).length === 0) delete settings.mcpServers;
+        fs.writeFileSync(projectSettingsPath, JSON.stringify(settings, null, 2), 'utf8');
+        logger.warn('TERMINAL:MCP_CONFIG_PROJECT_OVERRIDE_REMOVED', `Removed stale project-level MCP override that would have shadowed the global config: ${projectSettingsPath}`, {
+          projectSettingsPath
+        });
+      }
+    } catch (err) {
+      logger.warn('TERMINAL:MCP_CONFIG_PROJECT_OVERRIDE_CHECK_FAILED', `Could not inspect project-level ${projectSettingsPath}: ${err.message}`, { error: err.message });
+    }
+  }
+
   // Writes (or rewrites) the 'workbench' MCP server entry into the user's global
   // ~/.gemini/settings.json. Factored out of getTerminalConfig() so the same logic
   // can be re-run later by ensureGeminiMcpSettingsAlive() -- see that method's comment
   // for why this needs to happen more than once per terminal lifetime.
   _writeGeminiMcpSettings(targetCwd) {
+    this._neutralizeStaleProjectGeminiSettings(targetCwd);
     const bridgeScript = path.join(__serverDir, 'mcp', 'workbench_mcp_bridge.js');
     try {
       const globalGeminiDir = path.join(os.homedir(), '.gemini');
