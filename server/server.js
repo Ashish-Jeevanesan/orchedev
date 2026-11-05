@@ -99,6 +99,7 @@ export class WorkbenchServer {
     this.eventSockets = new Set();
     this.allocatedPort = null;
     this._autoPullInterval = null;
+    this._geminiMcpHealthInterval = null;
     this._lastAutoPulledTaskId = null;
     this._lastAutoPullTime = 0;
     this._lastApprovalSnapshot = null;
@@ -154,6 +155,20 @@ export class WorkbenchServer {
         this._autoPullInterval = setInterval(() => {
           this._checkAndTriggerAutoPull();
         }, 15000);
+
+        // Recurring self-heal check: Gemini CLI's own settings-persistence occasionally
+        // rewrites the whole ~/.gemini/settings.json file from its own in-memory state,
+        // silently dropping our hand-injected 'mcpServers.workbench' entry even while the
+        // terminal keeps running -- see the comment on
+        // TerminalManager.ensureGeminiMcpSettingsAlive() for how this was confirmed. This
+        // re-injects it if it ever goes missing, so the human never has to notice an
+        // MCP:OFFLINE badge and manually restart the terminal to recover.
+        this._geminiMcpHealthInterval = setInterval(() => {
+          const repaired = this.terminalManager.ensureGeminiMcpSettingsAlive();
+          if (repaired) {
+            this.broadcastEvent('gemini_mcp_self_healed', { timestamp: Date.now() });
+          }
+        }, 20000);
 
         // Scoped, logged auto-approval for Gemini's own permission prompts -- see
         // gemini_approval_policy.js for the rules. Never acts on anything flagged as
@@ -1417,6 +1432,11 @@ export class WorkbenchServer {
     if (this._autoPullInterval) {
       clearInterval(this._autoPullInterval);
       this._autoPullInterval = null;
+    }
+
+    if (this._geminiMcpHealthInterval) {
+      clearInterval(this._geminiMcpHealthInterval);
+      this._geminiMcpHealthInterval = null;
     }
 
     for (const ws of this.eventSockets) {

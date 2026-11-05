@@ -216,46 +216,8 @@ export class TerminalManager {
         args.push('--session-id', sessionId);
       }
       if (this.workbenchPort && this.sessionToken) {
-        try {
-          const globalGeminiDir = path.join(os.homedir(), '.gemini');
-          if (!fs.existsSync(globalGeminiDir)) fs.mkdirSync(globalGeminiDir, { recursive: true });
-          const settingsPath = path.join(globalGeminiDir, 'settings.json');
-          let settings = {};
-          if (fs.existsSync(settingsPath)) {
-            if (!this.preExistingConfigs.has(settingsPath)) {
-              this.preExistingConfigs.set(settingsPath, fs.readFileSync(settingsPath, 'utf8'));
-            }
-            try {
-              settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-            } catch (e) {
-              settings = {};
-            }
-          } else {
-            this.generatedFiles.add(settingsPath);
-          }
-          settings.mcpServers = settings.mcpServers || {};
-          settings.ui = settings.ui || {};
-          settings.ui.useAlternateBuffer = true;
-          settings.mcpServers.workbench = {
-            command: 'node',
-            args: [
-              bridgeScript,
-              '--agent', 'gemini',
-              '--port', String(this.workbenchPort),
-              '--token', this.sessionToken,
-              '--cwd', resolvedCwd
-            ],
-            trust: true
-          };
-          fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
-          args.push('--allowed-mcp-server-names', 'workbench');
-          logger.info('TERMINAL:MCP_CONFIG_PREPARED', `Prepared Gemini user profile MCP configuration in ${settingsPath}`, {
-            settingsPath,
-            port: this.workbenchPort
-          });
-        } catch (err) {
-          logger.error('TERMINAL:MCP_CONFIG_ERROR', `Failed to write Gemini MCP settings: ${err.message}`, { error: err.message });
-        }
+        this._writeGeminiMcpSettings(resolvedCwd);
+        args.push('--allowed-mcp-server-names', 'workbench');
       }
 
       return {
@@ -266,6 +228,103 @@ export class TerminalManager {
     } else {
       throw new Error(`Unknown terminal ID: ${id}`);
     }
+  }
+
+  // Writes (or rewrites) the 'workbench' MCP server entry into the user's global
+  // ~/.gemini/settings.json. Factored out of getTerminalConfig() so the same logic
+  // can be re-run later by ensureGeminiMcpSettingsAlive() -- see that method's comment
+  // for why this needs to happen more than once per terminal lifetime.
+  _writeGeminiMcpSettings(targetCwd) {
+    const bridgeScript = path.join(__serverDir, 'mcp', 'workbench_mcp_bridge.js');
+    try {
+      const globalGeminiDir = path.join(os.homedir(), '.gemini');
+      if (!fs.existsSync(globalGeminiDir)) fs.mkdirSync(globalGeminiDir, { recursive: true });
+      const settingsPath = path.join(globalGeminiDir, 'settings.json');
+      let settings = {};
+      if (fs.existsSync(settingsPath)) {
+        if (!this.preExistingConfigs.has(settingsPath)) {
+          this.preExistingConfigs.set(settingsPath, fs.readFileSync(settingsPath, 'utf8'));
+        }
+        try {
+          settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+        } catch (e) {
+          settings = {};
+        }
+      } else {
+        this.generatedFiles.add(settingsPath);
+      }
+      settings.mcpServers = settings.mcpServers || {};
+      settings.ui = settings.ui || {};
+      settings.ui.useAlternateBuffer = true;
+      settings.mcpServers.workbench = {
+        command: 'node',
+        args: [
+          bridgeScript,
+          '--agent', 'gemini',
+          '--port', String(this.workbenchPort),
+          '--token', this.sessionToken,
+          '--cwd', targetCwd
+        ],
+        trust: true
+      };
+      fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
+      logger.info('TERMINAL:MCP_CONFIG_PREPARED', `Prepared Gemini user profile MCP configuration in ${settingsPath}`, {
+        settingsPath,
+        port: this.workbenchPort
+      });
+      return true;
+    } catch (err) {
+      logger.error('TERMINAL:MCP_CONFIG_ERROR', `Failed to write Gemini MCP settings: ${err.message}`, { error: err.message });
+      return false;
+    }
+  }
+
+  // Gemini CLI's own settings-persistence occasionally rewrites the ENTIRE
+  // ~/.gemini/settings.json file from its own in-memory settings object (e.g. when it
+  // records a model change or migrates a deprecated field) -- and that in-memory object
+  // never learned about the 'mcpServers.workbench' entry we hand-inject, since it was
+  // added to the file by us, not through Gemini's own settings API. The result: our MCP
+  // registration silently disappears mid-session even though the Gemini terminal process
+  // is still running fine, and the workbench's MCP badge goes OFFLINE with no user action
+  // able to fix it short of restarting the terminal. Confirmed by direct observation: a
+  // live ~/.gemini/settings.json lost 'mcpServers' entirely while keeping another field
+  // ('ui.useAlternateBuffer') we wrote in the same call, proving a later whole-file
+  // rewrite (not a partial edit) is what's clobbering it.
+  //
+  // Self-healing fix: while the Gemini terminal is RUNNING, periodically verify our entry
+  // is still present and rewrite it if it's gone. This doesn't touch Gemini CLI's own
+  // code (it's vendored, not ours to patch) and is idempotent -- safe to call on a timer.
+  // Returns true if a repair was actually needed and performed, false if everything was
+  // already intact (or there's no active Gemini terminal / no workbench port yet).
+  ensureGeminiMcpSettingsAlive() {
+    const term = this.terminals.get('gemini');
+    if (!term || term.status !== 'RUNNING') return false;
+    if (!this.workbenchPort || !this.sessionToken) return false;
+
+    const settingsPath = path.join(os.homedir(), '.gemini', 'settings.json');
+    let settings = null;
+    try {
+      settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    } catch (e) {
+      settings = null;
+    }
+
+    const entry = settings && settings.mcpServers && settings.mcpServers.workbench;
+    const expectedArgs = JSON.stringify([
+      '--agent', 'gemini',
+      '--port', String(this.workbenchPort),
+      '--token', this.sessionToken,
+      '--cwd', term.cwd
+    ]);
+    const intact = entry && entry.trust === true && JSON.stringify((entry.args || []).slice(1)) === expectedArgs;
+
+    if (intact) return false;
+
+    logger.warn('TERMINAL:MCP_CONFIG_SELF_HEAL', 'Gemini MCP registration missing or stale mid-session; re-injecting into ~/.gemini/settings.json', {
+      pid: term.pid,
+      cwd: term.cwd
+    });
+    return this._writeGeminiMcpSettings(term.cwd);
   }
 
   startTerminal(id, { cols = 80, rows = 24, cwd = null, resumeSessionId = null } = {}, onData, onExit) {
