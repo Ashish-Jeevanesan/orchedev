@@ -39,7 +39,7 @@
       </div>
       <div class="workspace-bar">
         <span class="ws-label" id="ws-label-folder" title="Active Project Workspace">Working Folder:</span>
-        <span class="ws-path" id="ws-path-display" title="Click to manually enter path">D:\Ashish_P\AI-Tools\custom-OCT</span>
+        <span class="ws-path" id="ws-path-display" title="Click to manually enter path">Loading workspace...</span>
         <button class="btn btn-xs btn-outline" id="btn-copy-ws-path" title="Copy current workspace path to clipboard">Copy</button>
         <select id="ws-quick-switch" class="select-input select-xs" title="Switch between authorized workspace roots" style="display:none;"></select>
         <button class="btn btn-xs btn-outline" id="btn-browse-folder" title="Browse for project folder via Windows native dialog">Browse...</button>
@@ -50,6 +50,10 @@
         <span class="status-dot"></span>
         <span class="status-text">Connected</span>
       </div>
+      <button class="btn btn-sm btn-outline" id="btn-gemini-sleep-mode" title="When ON, Gemini's own shell-execution prompts are auto-approved without waiting for you (file edits and untrusted/dangerous commands still escalate). Every approval is logged.">
+        <span class="btn-icon" id="icon-sleep-mode"></span> <span id="sleep-mode-label">Sleep Mode: OFF</span>
+      </button>
+      <button class="btn btn-sm btn-outline" id="btn-open-sessions" title="Browse and resume past Claude/Gemini CLI sessions">Sessions</button>
       <button class="btn btn-sm btn-danger" id="btn-shutdown" title="Terminate all processes and close workbench">Shutdown</button>
     </div>
   </header>
@@ -57,12 +61,13 @@
   <!-- Main Body Layout: Left Sidebar (Composer & Task List), Center (Terminal), Right (Task Detail) -->
   <main class="workbench-layout">
     <!-- Left Sidebar: Task Prompt Composer & Task Navigation -->
-    <aside class="pane sidebar-pane">
+    <aside class="pane sidebar-pane" id="pane-sidebar">
       <div class="pane-header">
         <div class="pane-title">
           <span class="pane-icon" id="icon-sidebar-title"></span>
-          <span>Task Composer</span>
+          <span class="pane-title-text">Task Composer</span>
         </div>
+        <button class="btn-pane-toggle" id="btn-toggle-sidebar" title="Hide Task Composer panel" data-pane="sidebar">&laquo;</button>
       </div>
 
       <!-- Task Composer Section -->
@@ -106,8 +111,11 @@
       </div>
     </aside>
 
+    <!-- Resize handle: Sidebar <-> Terminal -->
+    <div class="pane-resize-handle" id="resize-handle-left" data-handle="left" title="Drag to resize"></div>
+
     <!-- Center Pane: Interactive ConPTY Terminal Workspace -->
-    <section class="pane terminal-pane">
+    <section class="pane terminal-pane" id="pane-terminal">
       <div class="pane-header">
         <div class="terminal-tabs">
           <button class="tab-btn active" data-term="claude" id="tab-claude" title="Switch to Claude Code interactive session">
@@ -126,7 +134,12 @@
           <button class="btn btn-xs btn-secondary" id="btn-term-restart" title="Restart terminal process">Restart</button>
           <button class="btn btn-xs btn-danger" id="btn-term-stop" title="Terminate terminal process tree">Terminate</button>
           <button class="btn btn-xs btn-outline" id="btn-term-clear" title="Clear xterm visible display buffer (does not write to PTY stdin)">Clear Buffer</button>
+          <button class="btn-pane-toggle" id="btn-toggle-terminal" title="Hide Terminal panel" data-pane="terminal">&minus;</button>
         </div>
+      </div>
+      <div class="pane-collapsed-label" id="collapsed-label-terminal">
+        <span class="pane-icon" id="icon-collapsed-terminal"></span>
+        <span class="pane-title-text">Terminal</span>
       </div>
       <div class="terminal-meta-bar">
         <span class="meta-item"><span class="meta-label">Mode:</span> ConPTY Interactive</span>
@@ -142,14 +155,18 @@
       </div>
     </section>
 
+    <!-- Resize handle: Terminal <-> Task Detail -->
+    <div class="pane-resize-handle" id="resize-handle-right" data-handle="right" title="Drag to resize"></div>
+
     <!-- Right Pane: Task Detail Inspector -->
-    <section class="pane task-detail-pane">
+    <section class="pane task-detail-pane" id="pane-detail">
       <div class="pane-header">
         <div class="pane-title">
           <span class="pane-icon" id="icon-inspector-title"></span>
-          <span>Task Detail Inspector</span>
+          <span class="pane-title-text">Task Detail Inspector</span>
           <span class="badge badge-sm badge-secondary">Real-Time</span>
         </div>
+        <button class="btn-pane-toggle" id="btn-toggle-detail" title="Hide Task Detail panel" data-pane="detail">&raquo;</button>
       </div>
       <div class="task-detail-panel" id="task-detail-container">
         <div class="empty-state">Select a task on the left to inspect parameters, execution timeline, and output.</div>
@@ -250,6 +267,31 @@
         <button class="btn btn-sm btn-success" id="btn-appr-approve">
           <span class="btn-icon" id="icon-appr-check"></span> Approve Plan
         </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: CLI Session History (Claude + Gemini) -->
+  <div class="modal-backdrop" id="modal-sessions" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="modal-sessions-title">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <div class="modal-title" id="modal-sessions-title">
+          <span>Session History</span>
+        </div>
+        <button class="btn-close" id="btn-close-sessions" title="Close (Esc)">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="sessions-filter-tabs" id="sessions-filter-tabs">
+          <button class="filter-btn active" data-agent="all" id="btn-sessions-filter-all">All</button>
+          <button class="filter-btn" data-agent="claude" id="btn-sessions-filter-claude" title="Claude sessions, including any that delegated work to Gemini">Claude</button>
+          <button class="filter-btn" data-agent="gemini" id="btn-sessions-filter-gemini" title="Gemini used standalone, with no Claude session">Gemini (standalone)</button>
+        </div>
+        <div class="sessions-list" id="sessions-list-container">
+          <div class="empty-state">No past sessions recorded yet.</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <span class="modal-hint">Resuming restarts that terminal with the CLI's own <code>--resume</code>, bringing its full conversation history back.</span>
       </div>
     </div>
   </div>

@@ -3,12 +3,71 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
+import crypto from 'crypto';
+import { execSync } from 'child_process';
 import pty from '@homebridge/node-pty-prebuilt-multiarch';
 import { ProcessManager } from '../core/process_manager.js';
 import { logger } from './logger.js';
+import { fileURLToPath as __toPath } from 'url';
+const __serverDir = path.dirname(__toPath(import.meta.url));
 
-const CLAUDE_BIN = 'C:\\Users\\ajeevanesan\\.local\\bin\\claude.exe';
-const GEMINI_BUNDLE_PATH = 'C:\\Users\\ajeevanesan\\AppData\\Local\\nvm\\v22.23.1\\node_modules\\@google\\gemini-cli\\bundle\\gemini.js';
+function resolveClaudeBin() {
+  let globalNpmCandidate = null;
+  try {
+    const globalRoot = execSync('npm root -g', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    if (globalRoot) {
+      globalNpmCandidate = path.join(globalRoot, '@anthropic-ai', 'claude-code', 'bin', process.platform === 'win32' ? 'claude.exe' : 'claude');
+    }
+  } catch (e) {}
+
+  const candidates = [
+    process.env.CLAUDE_BIN,
+    // macOS candidates
+    '/opt/homebrew/bin/claude',
+    '/usr/local/bin/claude',
+    path.join(os.homedir(), '.npm-global', 'bin', 'claude'),
+    path.join(os.homedir(), '.local', 'bin', 'claude'),
+    // Dynamic global npm lookup
+    globalNpmCandidate,
+    // Windows paths
+    path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'claude', 'claude.exe'),
+    path.join(process.env.USERPROFILE || '', '.local', 'bin', 'claude.exe'),
+    'C:\\Users\\ajeevanesan\\.local\\bin\\claude.exe'
+  ].filter(Boolean);
+
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return 'claude';
+}
+
+function resolveGeminiBundlePath() {
+  let globalNpmCandidate = null;
+  try {
+    const globalRoot = execSync('npm root -g', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    if (globalRoot) {
+      globalNpmCandidate = path.join(globalRoot, '@google', 'gemini-cli', 'bundle', 'gemini.js');
+    }
+  } catch (e) {}
+
+  const candidates = [
+    process.env.GEMINI_BUNDLE_PATH,
+    globalNpmCandidate,
+    '/opt/homebrew/lib/node_modules/@google/gemini-cli/bundle/gemini.js',
+    '/usr/local/lib/node_modules/@google/gemini-cli/bundle/gemini.js',
+    path.join(os.homedir(), '.npm-global', 'lib', 'node_modules', '@google', 'gemini-cli', 'bundle', 'gemini.js'),
+    path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@google', 'gemini-cli', 'bundle', 'gemini.js'),
+    'C:\\Users\\ajeevanesan\\AppData\\Local\\nvm\\v22.23.1\\node_modules\\@google\\gemini-cli\\bundle\\gemini.js'
+  ].filter(Boolean);
+
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return null;
+}
+
 const MAX_SCROLLBACK_BYTES = 1024 * 1024; // 1 MB bounded scrollback replay buffer
 
 export class TerminalManager {
@@ -21,6 +80,66 @@ export class TerminalManager {
     this.generatedFiles = new Set();
     this.preExistingConfigs = new Map(); // filePath -> originalStringContent
     this.activeInstanceIds = new Map(); // id -> instanceId
+
+    // Debounced "output has gone quiet" tracking per terminal id, independent of
+    // terminalRecord so listeners survive a restartTerminal() recreating the record.
+    this._outputWatch = new Map(); // id -> { buffer: '', timer: null, lastDataAt: 0 }
+    this._quietListeners = new Map(); // id -> Set<(bufferSnapshot: string) => void>
+    this._globalExitListeners = new Set();
+  }
+
+  clearScrollback(id) {
+    const term = this.terminals.get(id);
+    if (term) {
+      term.scrollbackBuffer = '';
+    }
+  }
+
+  onGlobalExit(listener) {
+    if (typeof listener === 'function') {
+      this._globalExitListeners.add(listener);
+    }
+  }
+
+  // Register a listener fired with a bounded snapshot of recent raw PTY output once
+  // that terminal's output has gone quiet for ~500ms. Used for things that need to
+  // read a fully-drawn prompt/screen rather than a single arbitrary data chunk.
+  onQuietOutput(id, listener) {
+    if (!this._quietListeners.has(id)) this._quietListeners.set(id, new Set());
+    this._quietListeners.get(id).add(listener);
+  }
+
+  // True if no PTY output has been received for this terminal in the last quietMs.
+  // Used to avoid injecting synthetic input while the agent is mid-output.
+  isIdle(id, quietMs = 500) {
+    const w = this._outputWatch.get(id);
+    if (!w || !w.lastDataAt) return true;
+    return (Date.now() - w.lastDataAt) >= quietMs;
+  }
+
+  _feedOutputWatch(id, chunk) {
+    const listeners = this._quietListeners.get(id);
+    if (!this._outputWatch.has(id)) {
+      this._outputWatch.set(id, { buffer: '', timer: null, lastDataAt: 0 });
+    }
+    const w = this._outputWatch.get(id);
+    w.lastDataAt = Date.now();
+
+    if (!listeners || listeners.size === 0) return; // nothing to assemble a buffer for
+
+    w.buffer += chunk;
+    const MAX_WATCH_BYTES = 8192;
+    if (w.buffer.length > MAX_WATCH_BYTES) {
+      w.buffer = w.buffer.slice(-MAX_WATCH_BYTES);
+    }
+
+    if (w.timer) clearTimeout(w.timer);
+    w.timer = setTimeout(() => {
+      const snapshot = w.buffer;
+      for (const fn of listeners) {
+        try { fn(snapshot); } catch (e) {}
+      }
+    }, 500);
   }
 
   setWorkbenchConnection({ port, sessionToken }) {
@@ -37,24 +156,26 @@ export class TerminalManager {
     });
   }
 
-  getTerminalConfig(id, targetCwd = null) {
+  // sessionOpts: { sessionId, resumeSessionId }. Both Claude Code and Gemini CLI accept
+  // --session-id <uuid> to assign a known id to a brand-new conversation, and
+  // --resume <id> to reopen a past one -- confirmed against both CLIs' own --help output
+  // and (for Gemini) by live-resuming a real session in this workbench and getting an
+  // accurate recollection of the original conversation back.
+  getTerminalConfig(id, targetCwd = null, sessionOpts = {}) {
     const resolvedCwd = targetCwd || this.projectCwd || this.cwd;
-    const bridgeScript = path.join(this.cwd, 'server', 'mcp', 'workbench_mcp_bridge.js');
+    const bridgeScript = path.join(__serverDir, 'mcp', 'workbench_mcp_bridge.js');
+    const { sessionId = null, resumeSessionId = null } = sessionOpts;
 
     if (id === 'claude') {
       const args = [];
+      if (resumeSessionId) {
+        args.push('--resume', resumeSessionId);
+      } else if (sessionId) {
+        args.push('--session-id', sessionId);
+      }
       if (this.workbenchPort && this.sessionToken) {
-        const mcpDir = path.join(resolvedCwd, '.workbench');
         try {
-          if (!fs.existsSync(mcpDir)) fs.mkdirSync(mcpDir, { recursive: true });
-          const mcpConfigPath = path.join(mcpDir, 'claude_mcp_config.json');
-          if (fs.existsSync(mcpConfigPath)) {
-            if (!this.preExistingConfigs.has(mcpConfigPath)) {
-              this.preExistingConfigs.set(mcpConfigPath, fs.readFileSync(mcpConfigPath, 'utf8'));
-            }
-          } else {
-            this.generatedFiles.add(mcpConfigPath);
-          }
+          const mcpConfigPath = path.join(os.tmpdir(), 'orchedev_claude_mcp_config.json');
           const mcpConfig = {
             mcpServers: {
               workbench: {
@@ -71,6 +192,7 @@ export class TerminalManager {
           };
           fs.writeFileSync(mcpConfigPath, JSON.stringify(mcpConfig, null, 2), 'utf8');
           args.push('--mcp-config', mcpConfigPath);
+          this.generatedFiles.add(mcpConfigPath);
           logger.info('TERMINAL:MCP_CONFIG_PREPARED', `Prepared Claude MCP configuration in ${mcpConfigPath}`, {
             mcpConfigPath,
             port: this.workbenchPort
@@ -81,55 +203,25 @@ export class TerminalManager {
       }
 
       return {
-        file: CLAUDE_BIN,
+        file: resolveClaudeBin(),
         args,
         name: 'claude-interactive'
       };
     } else if (id === 'gemini') {
-      const args = [GEMINI_BUNDLE_PATH, '--skip-trust'];
+      const bundlePath = resolveGeminiBundlePath();
+      const args = bundlePath ? [bundlePath, '--skip-trust'] : ['--skip-trust'];
+      if (resumeSessionId) {
+        args.push('--resume', resumeSessionId);
+      } else if (sessionId) {
+        args.push('--session-id', sessionId);
+      }
       if (this.workbenchPort && this.sessionToken) {
-        const geminiDir = path.join(resolvedCwd, '.gemini');
-        try {
-          if (!fs.existsSync(geminiDir)) fs.mkdirSync(geminiDir, { recursive: true });
-          const settingsPath = path.join(geminiDir, 'settings.json');
-          let settings = {};
-          if (fs.existsSync(settingsPath)) {
-            if (!this.preExistingConfigs.has(settingsPath)) {
-              this.preExistingConfigs.set(settingsPath, fs.readFileSync(settingsPath, 'utf8'));
-            }
-            try {
-              settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-            } catch (e) {
-              settings = {};
-            }
-          } else {
-            this.generatedFiles.add(settingsPath);
-          }
-          settings.mcpServers = settings.mcpServers || {};
-          settings.mcpServers.workbench = {
-            command: 'node',
-            args: [
-              bridgeScript,
-              '--agent', 'gemini',
-              '--port', String(this.workbenchPort),
-              '--token', this.sessionToken,
-              '--cwd', resolvedCwd
-            ],
-            trust: true
-          };
-          fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
-          args.push('--allowed-mcp-server-names', 'workbench');
-          logger.info('TERMINAL:MCP_CONFIG_PREPARED', `Prepared Gemini workspace MCP configuration in ${settingsPath}`, {
-            settingsPath,
-            port: this.workbenchPort
-          });
-        } catch (err) {
-          logger.error('TERMINAL:MCP_CONFIG_ERROR', `Failed to write Gemini MCP settings: ${err.message}`, { error: err.message });
-        }
+        this._writeGeminiMcpSettings(resolvedCwd);
+        args.push('--allowed-mcp-server-names', 'workbench');
       }
 
       return {
-        file: process.execPath,
+        file: bundlePath ? process.execPath : (process.platform === 'win32' ? 'gemini.cmd' : 'gemini'),
         args,
         name: 'gemini-interactive'
       };
@@ -138,7 +230,135 @@ export class TerminalManager {
     }
   }
 
-  startTerminal(id, { cols = 80, rows = 24, cwd = null } = {}, onData, onExit) {
+  // Gemini CLI layers a PROJECT-level <cwd>/.gemini/settings.json on top of the global
+  // ~/.gemini/settings.json, and project settings win. We only ever write the global
+  // file (see _writeGeminiMcpSettings below) -- but a stale project-level file left over
+  // from before this codebase migrated to the global-only approach (or from a prior,
+  // now-dead instance of this same workbench that happened to run older code) silently
+  // overrides whatever correct port/token we write globally, with NO error or visible
+  // symptom other than MCP staying OFFLINE forever. Confirmed by direct reproduction:
+  // found and neutralized exactly such a file during live debugging, which is what
+  // finally fixed a real MCP:OFFLINE case that writing the global file alone did not.
+  // Called every time we're about to (re)spawn or self-heal Gemini's config, so a stray
+  // project-level override can never silently reappear and shadow the global file again.
+  _neutralizeStaleProjectGeminiSettings(targetCwd) {
+    const projectSettingsPath = path.join(targetCwd, '.gemini', 'settings.json');
+    if (!fs.existsSync(projectSettingsPath)) return;
+    try {
+      const raw = fs.readFileSync(projectSettingsPath, 'utf8');
+      const settings = JSON.parse(raw);
+      if (settings.mcpServers && settings.mcpServers.workbench) {
+        delete settings.mcpServers.workbench;
+        if (Object.keys(settings.mcpServers).length === 0) delete settings.mcpServers;
+        fs.writeFileSync(projectSettingsPath, JSON.stringify(settings, null, 2), 'utf8');
+        logger.warn('TERMINAL:MCP_CONFIG_PROJECT_OVERRIDE_REMOVED', `Removed stale project-level MCP override that would have shadowed the global config: ${projectSettingsPath}`, {
+          projectSettingsPath
+        });
+      }
+    } catch (err) {
+      logger.warn('TERMINAL:MCP_CONFIG_PROJECT_OVERRIDE_CHECK_FAILED', `Could not inspect project-level ${projectSettingsPath}: ${err.message}`, { error: err.message });
+    }
+  }
+
+  // Writes (or rewrites) the 'workbench' MCP server entry into the user's global
+  // ~/.gemini/settings.json. Factored out of getTerminalConfig() so the same logic
+  // can be re-run later by ensureGeminiMcpSettingsAlive() -- see that method's comment
+  // for why this needs to happen more than once per terminal lifetime.
+  _writeGeminiMcpSettings(targetCwd) {
+    this._neutralizeStaleProjectGeminiSettings(targetCwd);
+    const bridgeScript = path.join(__serverDir, 'mcp', 'workbench_mcp_bridge.js');
+    try {
+      const globalGeminiDir = path.join(os.homedir(), '.gemini');
+      if (!fs.existsSync(globalGeminiDir)) fs.mkdirSync(globalGeminiDir, { recursive: true });
+      const settingsPath = path.join(globalGeminiDir, 'settings.json');
+      let settings = {};
+      if (fs.existsSync(settingsPath)) {
+        if (!this.preExistingConfigs.has(settingsPath)) {
+          this.preExistingConfigs.set(settingsPath, fs.readFileSync(settingsPath, 'utf8'));
+        }
+        try {
+          settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+        } catch (e) {
+          settings = {};
+        }
+      } else {
+        this.generatedFiles.add(settingsPath);
+      }
+      settings.mcpServers = settings.mcpServers || {};
+      settings.ui = settings.ui || {};
+      settings.ui.useAlternateBuffer = true;
+      settings.mcpServers.workbench = {
+        command: 'node',
+        args: [
+          bridgeScript,
+          '--agent', 'gemini',
+          '--port', String(this.workbenchPort),
+          '--token', this.sessionToken,
+          '--cwd', targetCwd
+        ],
+        trust: true
+      };
+      fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
+      logger.info('TERMINAL:MCP_CONFIG_PREPARED', `Prepared Gemini user profile MCP configuration in ${settingsPath}`, {
+        settingsPath,
+        port: this.workbenchPort
+      });
+      return true;
+    } catch (err) {
+      logger.error('TERMINAL:MCP_CONFIG_ERROR', `Failed to write Gemini MCP settings: ${err.message}`, { error: err.message });
+      return false;
+    }
+  }
+
+  // Gemini CLI's own settings-persistence occasionally rewrites the ENTIRE
+  // ~/.gemini/settings.json file from its own in-memory settings object (e.g. when it
+  // records a model change or migrates a deprecated field) -- and that in-memory object
+  // never learned about the 'mcpServers.workbench' entry we hand-inject, since it was
+  // added to the file by us, not through Gemini's own settings API. The result: our MCP
+  // registration silently disappears mid-session even though the Gemini terminal process
+  // is still running fine, and the workbench's MCP badge goes OFFLINE with no user action
+  // able to fix it short of restarting the terminal. Confirmed by direct observation: a
+  // live ~/.gemini/settings.json lost 'mcpServers' entirely while keeping another field
+  // ('ui.useAlternateBuffer') we wrote in the same call, proving a later whole-file
+  // rewrite (not a partial edit) is what's clobbering it.
+  //
+  // Self-healing fix: while the Gemini terminal is RUNNING, periodically verify our entry
+  // is still present and rewrite it if it's gone. This doesn't touch Gemini CLI's own
+  // code (it's vendored, not ours to patch) and is idempotent -- safe to call on a timer.
+  // Returns true if a repair was actually needed and performed, false if everything was
+  // already intact (or there's no active Gemini terminal / no workbench port yet).
+  ensureGeminiMcpSettingsAlive() {
+    const term = this.terminals.get('gemini');
+    if (!term || term.status !== 'RUNNING') return false;
+    if (!this.workbenchPort || !this.sessionToken) return false;
+
+    const settingsPath = path.join(os.homedir(), '.gemini', 'settings.json');
+    let settings = null;
+    try {
+      settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    } catch (e) {
+      settings = null;
+    }
+
+    const entry = settings && settings.mcpServers && settings.mcpServers.workbench;
+    const expectedArgs = JSON.stringify([
+      '--agent', 'gemini',
+      '--port', String(this.workbenchPort),
+      '--token', this.sessionToken,
+      '--cwd', term.cwd
+    ]);
+    const intact = entry && entry.trust === true && JSON.stringify((entry.args || []).slice(1)) === expectedArgs;
+
+    if (intact) return false;
+
+    logger.warn('TERMINAL:MCP_CONFIG_SELF_HEAL', 'Gemini MCP registration missing or stale mid-session; re-injecting into ~/.gemini/settings.json', {
+      pid: term.pid,
+      cwd: term.cwd
+    });
+    return this._writeGeminiMcpSettings(term.cwd);
+  }
+
+  startTerminal(id, { cols = 80, rows = 24, cwd = null, resumeSessionId = null } = {}, onData, onExit) {
     let term = this.terminals.get(id);
 
     if (term && term.status === 'RUNNING') {
@@ -163,29 +383,48 @@ export class TerminalManager {
     }
 
     const targetCwd = cwd || this.projectCwd || this.cwd;
-    const config = this.getTerminalConfig(id, targetCwd);
+    // Only 'claude' and 'gemini' have a resumable CLI conversation concept; every fresh
+    // launch of either still gets a known id assigned up front (rather than letting the
+    // CLI pick one silently) so it can show up in the session list right away.
+    const isCliAgent = id === 'claude' || id === 'gemini';
+    const newSessionId = (!resumeSessionId && isCliAgent) ? crypto.randomUUID() : null;
+    const config = this.getTerminalConfig(id, targetCwd, { sessionId: newSessionId, resumeSessionId });
+    const cliSessionId = resumeSessionId || newSessionId;
 
     logger.info('TERMINAL:SPAWN', `Spawning ${id} ConPTY in directory: ${targetCwd}`, {
       id,
       file: config.file,
       cwd: targetCwd,
       cols,
-      rows
+      rows,
+      cliSessionId,
+      resumed: !!resumeSessionId
     });
 
-    // Spawn ConPTY process with explicit target working directory
+    // Spawn ConPTY process with explicit target working directory. Strip any
+    // CLAUDE_CODE_* env vars inherited from whatever process launched this workbench
+    // (e.g. running `npm start` from inside a Claude Code session/terminal) -- without
+    // this, a spawned 'claude' terminal can inherit CLAUDE_CODE_CHILD_SESSION /
+    // CLAUDE_CODE_SESSION_ID and treat itself as a child of that outer session instead
+    // of starting its own independent, --session-id/--resume-able conversation.
+    const childEnv = { ...process.env };
+    for (const key of Object.keys(childEnv)) {
+      if (key.startsWith('CLAUDE_CODE_')) delete childEnv[key];
+    }
+
     const ptyProcess = pty.spawn(config.file, config.args, {
       name: 'xterm-256color',
       cols: Math.max(20, cols),
       rows: Math.max(5, rows),
       cwd: targetCwd,
-      env: process.env
+      env: childEnv
     });
 
     const terminalRecord = {
       id,
       ptyProcess,
       pid: ptyProcess.pid,
+      cliSessionId,
       cwd: targetCwd,
       status: 'RUNNING',
       cols,
@@ -213,6 +452,9 @@ export class TerminalManager {
           listener(data);
         } catch (e) {}
       }
+
+      // 3. Feed the debounced quiet-output watch (approval-prompt detection, idle checks)
+      this._feedOutputWatch(id, data);
     });
 
     ptyProcess.onExit(({ exitCode, signal }) => {
@@ -235,6 +477,12 @@ export class TerminalManager {
           listener(exitCode, signal);
         } catch (e) {}
       }
+
+      for (const listener of this._globalExitListeners) {
+        try {
+          listener(id, exitCode, signal);
+        } catch (e) {}
+      }
     });
 
     this.terminals.set(id, terminalRecord);
@@ -247,7 +495,7 @@ export class TerminalManager {
     return terminalRecord;
   }
 
-  async restartTerminal(id, { cols = 80, rows = 24, cwd = null } = {}, onData, onExit) {
+  async restartTerminal(id, { cols = 80, rows = 24, cwd = null, resumeSessionId = null } = {}, onData, onExit) {
     const existing = this.terminals.get(id);
     const savedDataListeners = existing ? new Set(existing.dataListeners) : new Set();
     const savedExitListeners = existing ? new Set(existing.exitListeners) : new Set();
@@ -259,13 +507,14 @@ export class TerminalManager {
       id,
       oldPid: existing?.pid,
       oldCwd: existing?.cwd,
-      targetCwd: cwd || this.projectCwd || this.cwd
+      targetCwd: cwd || this.projectCwd || this.cwd,
+      resumeSessionId
     });
 
     await this.terminate(id);
 
     const targetCwd = cwd || this.projectCwd || this.cwd;
-    const newTerm = this.startTerminal(id, { cols, rows, cwd: targetCwd });
+    const newTerm = this.startTerminal(id, { cols, rows, cwd: targetCwd, resumeSessionId });
 
     // Re-attach active listeners from previous session
     for (const l of savedDataListeners) {
@@ -317,56 +566,44 @@ export class TerminalManager {
       return;
     }
 
-    const resolvedCwd = path.resolve(targetCwd || this.projectCwd || this.cwd);
-    const configFile = id === 'claude'
-      ? path.join(resolvedCwd, '.workbench', 'claude_mcp_config.json')
-      : path.join(resolvedCwd, '.gemini', 'settings.json');
-
-    try {
-      if (fs.existsSync(configFile)) {
-        if (id === 'gemini') {
-          try {
-            const currentSettings = JSON.parse(fs.readFileSync(configFile, 'utf8'));
-            if (currentSettings.mcpServers) {
-              delete currentSettings.mcpServers.workbench;
-              if (Object.keys(currentSettings.mcpServers).length === 0) {
-                delete currentSettings.mcpServers;
-              }
-            }
-            if (!this.preExistingConfigs.has(configFile) && Object.keys(currentSettings).length === 0) {
-              fs.unlinkSync(configFile);
-              logger.info('TERMINAL:CONFIG_UNLINKED', `Unlinked ephemeral workbench configuration: ${configFile}`);
-            } else {
-              fs.writeFileSync(configFile, JSON.stringify(currentSettings, null, 2), 'utf8');
-              logger.info('TERMINAL:CONFIG_PRUNED', `Removed workbench MCP entry while preserving user settings: ${configFile}`);
-            }
-          } catch (e) {
-            if (this.preExistingConfigs.has(configFile)) {
-              fs.writeFileSync(configFile, this.preExistingConfigs.get(configFile), 'utf8');
+    if (id === 'claude') {
+      const configFile = path.join(os.tmpdir(), 'orchedev_claude_mcp_config.json');
+      try {
+        if (fs.existsSync(configFile)) {
+          fs.unlinkSync(configFile);
+          logger.info('TERMINAL:CONFIG_UNLINKED', `Unlinked ephemeral workbench configuration: ${configFile}`);
+        }
+        this.preExistingConfigs.delete(configFile);
+        this.generatedFiles.delete(configFile);
+      } catch (e) {
+        logger.warn('TERMINAL:CONFIG_CLEANUP_WARN', `Could not clean config ${configFile}: ${e.message}`);
+      }
+    } else if (id === 'gemini') {
+      const settingsPath = path.join(os.homedir(), '.gemini', 'settings.json');
+      try {
+        if (fs.existsSync(settingsPath)) {
+          const currentSettings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+          if (currentSettings.mcpServers) {
+            delete currentSettings.mcpServers.workbench;
+            if (Object.keys(currentSettings.mcpServers).length === 0) {
+              delete currentSettings.mcpServers;
             }
           }
-        } else if (id === 'claude') {
-          if (!this.preExistingConfigs.has(configFile)) {
-            fs.unlinkSync(configFile);
-            logger.info('TERMINAL:CONFIG_UNLINKED', `Unlinked ephemeral workbench configuration: ${configFile}`);
+          if (!this.preExistingConfigs.has(settingsPath) && Object.keys(currentSettings).length === 0) {
+            fs.unlinkSync(settingsPath);
+            logger.info('TERMINAL:CONFIG_UNLINKED', `Unlinked ephemeral user settings: ${settingsPath}`);
           } else {
-            try {
-              const currentConfig = JSON.parse(fs.readFileSync(configFile, 'utf8'));
-              if (currentConfig.mcpServers) {
-                delete currentConfig.mcpServers.workbench;
-                if (Object.keys(currentConfig.mcpServers).length === 0) delete currentConfig.mcpServers;
-              }
-              fs.writeFileSync(configFile, JSON.stringify(currentConfig, null, 2), 'utf8');
-            } catch (e) {
-              fs.writeFileSync(configFile, this.preExistingConfigs.get(configFile), 'utf8');
-            }
+            fs.writeFileSync(settingsPath, JSON.stringify(currentSettings, null, 2), 'utf8');
+            logger.info('TERMINAL:CONFIG_PRUNED', `Removed workbench MCP entry from user settings: ${settingsPath}`);
           }
         }
+      } catch (e) {
+        if (this.preExistingConfigs.has(settingsPath)) {
+          try { fs.writeFileSync(settingsPath, this.preExistingConfigs.get(settingsPath), 'utf8'); } catch (err) {}
+        }
       }
-      this.preExistingConfigs.delete(configFile);
-      this.generatedFiles.delete(configFile);
-    } catch (e) {
-      logger.warn('TERMINAL:CONFIG_CLEANUP_WARN', `Could not clean config ${configFile}: ${e.message}`);
+      this.preExistingConfigs.delete(settingsPath);
+      this.generatedFiles.delete(settingsPath);
     }
   }
 
@@ -399,7 +636,7 @@ export class TerminalManager {
 
   getStatus(id) {
     const term = this.terminals.get(id);
-    if (!term) return { id, status: 'NOT_STARTED', pid: null, cwd: this.projectCwd || this.cwd };
+    if (!term) return { id, status: 'NOT_STARTED', pid: null, cwd: this.projectCwd || this.cwd, cliSessionId: null };
     return {
       id: term.id,
       status: term.status,
@@ -408,7 +645,8 @@ export class TerminalManager {
       cols: term.cols,
       rows: term.rows,
       startTime: term.startTime,
-      exitCode: term.exitCode
+      exitCode: term.exitCode,
+      cliSessionId: term.cliSessionId || null
     };
   }
 

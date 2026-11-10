@@ -6,12 +6,26 @@ import { spawn, execSync } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { fileURLToPath } from 'url';
 
-const CWD = 'D:\\Ashish_P\\AI-Tools\\custom-OCT';
-const SESSION_FILE = path.join(CWD, '.workbench_session.json');
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const CWD = process.env.WORKBENCH_CWD || path.resolve(__dirname, '..');
+const SESSION_FILE = path.join(os.tmpdir(), 'orchedev_session.json');
 const USER_DATA_DIR = path.join(os.tmpdir(), 'workbench_edge_profile');
 
 function findBrowserBinary() {
+  if (process.platform === 'darwin') {
+    const macPaths = [
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'
+    ];
+    for (const p of macPaths) {
+      if (fs.existsSync(p)) return p;
+    }
+    return null;
+  }
+
   const edgePaths = [
     'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
     'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -84,7 +98,11 @@ async function main() {
     appWindow.unref();
   } else if (!process.env.HEADLESS) {
     console.log('[Launcher] Opening in default browser...');
-    execSync(`start ${appUrl}`, { stdio: 'ignore' });
+    if (process.platform === 'darwin') {
+      execSync(`open "${appUrl}"`, { stdio: 'ignore' });
+    } else {
+      execSync(`start ${appUrl}`, { stdio: 'ignore' });
+    }
   } else {
     console.log('[Launcher] Running in HEADLESS mode (window spawn skipped)');
   }

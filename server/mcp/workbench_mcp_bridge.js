@@ -314,11 +314,16 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === 'get_delegation_status') {
       const { correlationId } = toolArgs || {};
       const task = await coordinatorFetch(`/api/intercom/tasks/${correlationId}`);
+      let text = JSON.stringify(task, null, 2);
+      if (task.geminiApprovalBlock) {
+        const b = task.geminiApprovalBlock;
+        text += `\n\n[BLOCKED ON GEMINI APPROVAL] Gemini has been waiting ${b.waitingSeconds}s for a human to answer its own permission prompt (${b.command || 'unknown command/file'}, reason: ${b.reason}). This is not something you can or should approve yourself -- tell the user Gemini needs their input in its terminal, and wait for them before assuming this task has progressed.`;
+      }
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify(task, null, 2)
+            text
           }
         ]
       };

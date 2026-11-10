@@ -47,12 +47,13 @@ async function main() {
 
   // Prepare Claude terminal config
   const claudeConfig = server.terminalManager.getTerminalConfig('claude', TEMP_WORKSPACE);
-  const mcpConfigFile = path.join(TEMP_WORKSPACE, '.workbench', 'claude_mcp_config.json');
-  assert(fs.existsSync(mcpConfigFile), 'Generated .workbench/claude_mcp_config.json');
+  const mcpConfigFile = claudeConfig.args[claudeConfig.args.indexOf('--mcp-config') + 1];
+  assert(fs.existsSync(mcpConfigFile), 'Generated temp Claude MCP config in os.tmpdir()');
+  assert(!fs.existsSync(path.join(TEMP_WORKSPACE, '.workbench', 'claude_mcp_config.json')), 'Workspace .workbench/claude_mcp_config.json not polluted');
 
   // Launch Claude Code with -p to test tool discovery and execution
   console.log('\n[Step 2] Executing Claude Code with --mcp-config to test discover_peers...');
-  const child = spawn(CLAUDE_BIN, [
+  const child = spawn(claudeConfig.file, [
     '--mcp-config', mcpConfigFile,
     '--permission-mode', 'plan',
     '--permission-prompts', 'none',

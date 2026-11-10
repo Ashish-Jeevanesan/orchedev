@@ -3,10 +3,12 @@ node_modules/
 
 # Runtime & session state
 .workbench/
+.workbench_cli_sessions/
 .workbench_tasks.json
 .workbench_tasks.json.corrupt_*
 .workbench_workspaces.json
 .workbench_session.json
+.workbench_session_pairings*.json
 .gemini/
 
 # Logs
@@ -24,3 +26,7 @@ e2e_proof_report.json
 Thumbs.db
 .vscode/
 .idea/
+
+# Device-specific launchers (kept local only, not pushed to GitHub)
+start-workbench.vbs
+start-workbench-office.vbs

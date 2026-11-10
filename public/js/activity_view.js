@@ -156,7 +156,6 @@ export class ActivityViewController {
 
     const entry = document.createElement('div');
     entry.className = `activity-entry activity-level-${level.toLowerCase()}`;
-    entry.dataset = entry.dataset || {};
     entry.dataset.category = category;
     entry.dataset.level = level;
 

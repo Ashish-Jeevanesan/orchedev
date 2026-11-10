@@ -7,6 +7,8 @@ import { TaskViewController } from './task_view.js';
 import { ActivityViewController } from './activity_view.js';
 import { dialogService } from './dialog_service.js';
 import { getIcon, initIcons } from './icons.js';
+import { PaneLayoutController } from './pane_layout.js';
+import { SessionsViewController } from './sessions_view.js';
 
 function extractAndClearToken() {
   const hash = window.location.hash;
@@ -65,6 +67,8 @@ class WorkbenchApp {
     initIcons();
 
     this.activityView = new ActivityViewController();
+    this.paneLayout = new PaneLayoutController();
+    this.paneLayout.init();
 
     this.taskView = new TaskViewController({
       token: this.token,
@@ -75,6 +79,18 @@ class WorkbenchApp {
       token: this.token,
       onStatusChange: (statuses) => this.terminalView.updateProcessStatuses(statuses)
     });
+
+    this.sessionsView = new SessionsViewController({
+      token: this.token,
+      onToast: (msg, type) => this.activityView.toast(msg, type),
+      onResumed: (agent) => {
+        if (this.terminalView) {
+          this.terminalView.clearBuffer(agent);
+          this.terminalView.switchTab(agent);
+        }
+      }
+    });
+    this.sessionsView.init();
 
     this.terminalView.init();
     await this.taskView.loadInitialTasks();
@@ -134,6 +150,22 @@ class WorkbenchApp {
         } else if (msg.type === 'workspace_changed') {
           const newCwd = msg.payload.projectCwd;
           this.setWorkingFolderDisplay(newCwd);
+        } else if (msg.type === 'gemini_approval') {
+          const payload = msg.payload || {};
+          const sleepTag = payload.sleepMode ? ' [Sleep Mode]' : '';
+          this.activityView.logWorkbenchEvent({
+            eventId: `GEMINI_APPROVAL_${payload.timestamp || Date.now()}`,
+            eventType: payload.decision === 'AUTO_APPROVED' ? 'GEMINI_AUTO_APPROVED' : 'GEMINI_APPROVAL_ESCALATED',
+            level: payload.decision === 'AUTO_APPROVED' ? 'INFO' : 'WARN',
+            timestamp: payload.timestamp || Date.now(),
+            summary: payload.decision === 'AUTO_APPROVED'
+              ? `Auto-approved Gemini prompt (${payload.reason})${sleepTag}: ${payload.command || ''}`
+              : `Gemini permission prompt needs your review (${payload.reason}): ${payload.command || ''}`
+          });
+        } else if (msg.type === 'gemini_sleep_mode_changed') {
+          const enabled = !!(msg.payload && msg.payload.enabled);
+          this._setSleepModeUi(enabled);
+          this.activityView.toast(`Gemini Sleep Mode turned ${enabled ? 'ON' : 'OFF'}`, enabled ? 'warning' : 'info');
         }
       } catch (e) {
         console.error('Error handling WebSocket event:', e);
@@ -193,6 +225,9 @@ class WorkbenchApp {
       }
       if (data.terminals) {
         this.terminalView.updateProcessStatuses(data.terminals);
+      }
+      if (typeof data.geminiSleepMode === 'boolean') {
+        this._setSleepModeUi(data.geminiSleepMode);
       }
 
       // Query active peers for initial MCP bridge health indicators
@@ -349,6 +384,51 @@ class WorkbenchApp {
         }
       });
     }
+
+    // 6. Gemini Sleep Mode toggle (auto-approve all of Gemini's own shell prompts while
+    // unattended; file edits and dangerous/untrusted commands still always escalate).
+    const sleepModeBtn = document.getElementById('btn-gemini-sleep-mode');
+    if (sleepModeBtn) {
+      sleepModeBtn.addEventListener('click', async () => {
+        const turningOn = !sleepModeBtn.classList.contains('active');
+        if (turningOn) {
+          const confirmed = await dialogService.confirm({
+            title: 'Enable Gemini Sleep Mode?',
+            message: 'Gemini will auto-approve its own shell-execution prompts without waiting for you — for unattended use (e.g. overnight). File edits, and any command flagged dangerous or carrying untrusted input, will still stop and wait for you. Every approval is logged to the Activity Feed and logs/workbench.log.',
+            confirmText: 'Enable Sleep Mode',
+            icon: 'alert-triangle'
+          });
+          if (!confirmed) return;
+        }
+
+        sleepModeBtn.disabled = true;
+        try {
+          const res = await fetch('/api/gemini/sleep-mode', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Session-Token': this.token
+            },
+            body: JSON.stringify({ enabled: turningOn })
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || 'Failed to update sleep mode');
+          this._setSleepModeUi(data.enabled);
+        } catch (err) {
+          this.activityView.toast(`Sleep Mode change failed: ${err.message}`, 'error');
+        } finally {
+          sleepModeBtn.disabled = false;
+        }
+      });
+    }
+  }
+
+  _setSleepModeUi(enabled) {
+    const btn = document.getElementById('btn-gemini-sleep-mode');
+    if (!btn) return;
+    btn.classList.toggle('active', !!enabled);
+    const label = document.getElementById('sleep-mode-label');
+    if (label) label.textContent = `Sleep Mode: ${enabled ? 'ON' : 'OFF'}`;
   }
 }
 
