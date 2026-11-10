@@ -3,6 +3,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 import { WorkbenchServer } from '../server/server.js';
@@ -39,9 +40,10 @@ async function main() {
   console.log(`[Step 1] Workbench running on 127.0.0.1:${port}`);
 
   // 2. Prepare terminal configuration in temp_workspace
-  server.terminalManager.getTerminalConfig('gemini', TEMP_WORKSPACE);
-  const geminiSettingsFile = path.join(TEMP_WORKSPACE, '.gemini', 'settings.json');
-  assert(fs.existsSync(geminiSettingsFile), 'Workspace .gemini/settings.json created');
+  const geminiConfig = server.terminalManager.getTerminalConfig('gemini', TEMP_WORKSPACE);
+  const userSettingsFile = path.join(os.homedir(), '.gemini', 'settings.json');
+  assert(fs.existsSync(userSettingsFile), 'User profile ~/.gemini/settings.json exists');
+  assert(!fs.existsSync(path.join(TEMP_WORKSPACE, '.gemini', 'settings.json')), 'Workspace .gemini/settings.json not polluted');
 
   // 3. Create an approved test task through controlled test fixture
   console.log('\n[Step 2] Creating approved delegation task in Coordinator...');
@@ -61,14 +63,10 @@ async function main() {
   assert(task.cwd === TEMP_WORKSPACE, `Task CWD matches target workspace: ${task.cwd}`);
 
   // 4. Test Gemini CLI discovering and invoking the MCP tools
-  // We run Gemini CLI in temp_workspace with non-interactive prompt testing tool discovery:
-  // "Call the MCP tool discover_peers and then call get_inbox to check for tasks."
   console.log('\n[Step 3] Executing Gemini CLI in workspace to verify MCP tool invocation...');
-  const child = spawn(process.execPath, [
-    GEMINI_BUNDLE_PATH,
-    '-p',
-    'Call the discover_peers MCP tool to check peers, and then call the get_inbox MCP tool. Report the results.'
-  ], {
+  const geminiExecFile = geminiConfig.file;
+  const geminiExecArgs = [...geminiConfig.args, '-p', 'Call the discover_peers MCP tool to check peers, and then call the get_inbox MCP tool. Report the results.'];
+  const child = spawn(geminiExecFile, geminiExecArgs, {
     cwd: TEMP_WORKSPACE,
     env: { ...process.env, CI: '1' }
   });
